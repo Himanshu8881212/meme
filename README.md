@@ -180,9 +180,9 @@ specific benchmark and scores nothing on the synthesis / identity
 dimensions. We score competitively on LongMemEval *and* retain the
 things that make this system a mind.
 
-Benchmarks are runnable: `python bench_longmemeval.py`,
-`python bench_membench.py`, `python bench_memoryagent.py`,
-`python eval.py`.
+Benchmark runners aren't shipped in this repo (they live in a separate
+R&D branch) — the scores above are what we measured during development
+with Mistral's magistral-medium + mistral-small stack.
 
 ---
 
@@ -255,9 +255,6 @@ Every test uses an offline `echo` backend — no API keys required.
 main.py             CLI: init, decay, monitor, meta, ingest, index
 tui.py              Interactive TUI
 mcp_server.py       MCP stdio server (7 tools)
-eval.py             Synthesis eval harness
-bench_*.py          Public benchmark runners (LongMemEval, MemBench, MemoryAgentBench)
-battery.py          8-scenario end-to-end smoke suite
 
 config/config.yaml  Providers, models, thresholds
 prompts/            System prompt, reflection prompts, persona templates
