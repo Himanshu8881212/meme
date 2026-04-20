@@ -99,6 +99,60 @@ def test_strip_meme_flags_preserves_paralinguistic():
     assert "Nice one" in out
 
 
+def test_chat_stream_skips_magistral_thinking_chunks(config, monkeypatch):
+    """Magistral streams reasoning in `thinking`-type content parts. Those
+    must NEVER reach the voice TUI — otherwise TTS speaks the internal
+    monologue. Regression test for the 'think think think' bug."""
+    monkeypatch.delenv("MEMORY_BACKEND")
+    config["providers"]["mistral"] = {"base_url": "https://x", "api_key_env": "FAKE"}
+    config["models"]["model1"] = {"provider": "mistral", "model": "fake-magistral"}
+
+    # Simulate magistral's structured stream: first thinking, then text.
+    events = [
+        _chunk([{"type": "thinking", "thinking": "let me reason..."}]),
+        _chunk([{"type": "thinking", "thinking": " considering options..."}]),
+        _chunk([{"type": "text", "text": "Hello,"}]),
+        _chunk([{"type": "text", "text": " here is the answer."}]),
+    ]
+    client = MagicMock()
+    client.chat.completions.create = MagicMock(return_value=iter(events))
+
+    with patch.object(reflection, "_get_client", return_value=client):
+        out = list(reflection.chat_stream(
+            role="model1", system="",
+            messages=[{"role": "user", "content": "hi"}],
+            config=config,
+        ))
+
+    joined = "".join(out)
+    assert "let me reason" not in joined
+    assert "considering options" not in joined
+    assert "Hello," in joined
+    assert "here is the answer." in joined
+
+
+def test_extract_text_only_handles_all_shapes():
+    """_extract_text_only is the gate that prevents reasoning leaks."""
+    from core.reflection import _extract_text_only
+
+    assert _extract_text_only("plain") == "plain"
+    assert _extract_text_only(None) == ""
+    # List of dict-style parts
+    assert _extract_text_only([
+        {"type": "thinking", "thinking": "DROP"},
+        {"type": "text", "text": "keep"},
+    ]) == "keep"
+    # List of object-style parts
+    class P:
+        def __init__(self, **kw):
+            for k, v in kw.items():
+                setattr(self, k, v)
+    assert _extract_text_only([
+        P(type="thinking", thinking="DROP"),
+        P(type="text", text="keep"),
+    ]) == "keep"
+
+
 def test_strip_meme_flags_removes_all_meme_flags():
     from tui_common import strip_meme_flags
 

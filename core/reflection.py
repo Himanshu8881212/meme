@@ -235,6 +235,35 @@ def strip_thinking(text: str) -> str:
     return THINK_BLOCK.sub("", text).strip()
 
 
+def _extract_text_only(content: Any) -> str:
+    """Return only the user-visible text from a streaming content chunk.
+
+    Magistral returns deltas whose `content` is a list of parts — some are
+    `text`, some are `thinking`/`reasoning`. For streaming to TTS we want
+    ONLY the text, never the internal reasoning trace. Thinking chunks are
+    silently dropped here so the voice TUI can't accidentally speak them.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict):
+            if item.get("type") == "text":
+                parts.append(item.get("text") or "")
+            # thinking / reasoning chunks: skip entirely
+        else:
+            kind = getattr(item, "type", None)
+            if kind == "text":
+                parts.append(getattr(item, "text", "") or "")
+    return "".join(parts)
+
+
 def _normalize_content(content: Any) -> str:
     """Flatten a chat-completion content field to a plain string.
 
@@ -374,9 +403,11 @@ def chat_stream(
                 content = getattr(delta, "content", None)
                 if content is None:
                     continue
-                # Magistral occasionally hands us a list of parts mid-stream;
-                # normalize so the caller only ever sees a string.
-                yield _normalize_content(content)
+                # Text-only extraction: thinking/reasoning chunks are silently
+                # dropped so the caller (e.g. voice TTS) never speaks them.
+                text = _extract_text_only(content)
+                if text:
+                    yield text
             return
         except Exception as exc:
             last_exc = exc
