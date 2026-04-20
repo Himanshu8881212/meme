@@ -233,6 +233,83 @@ def strip_meme_flags(text: str) -> str:
     return _MEME_FLAG_RE.sub("", text).strip()
 
 
+# --- TTS cleaner ------------------------------------------------------------
+# The TTS model speaks literally — `*bold*` becomes "asterisk bold asterisk".
+# This cleaner strips every bit of markdown and code formatting but keeps
+# ChatterBox paralinguistic tags ([laugh] etc.) intact.
+
+_CODE_FENCE = re.compile(r"```([a-zA-Z0-9_+\-]*)\n(.*?)(?:\n```|\Z)", re.DOTALL)
+_INLINE_CODE = re.compile(r"`([^`\n]+)`")
+_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_MD_BOLD = re.compile(r"\*\*([^*\n]+)\*\*")
+_MD_ITAL_STAR = re.compile(r"(?<!\*)\*([^*\n]+)\*(?!\*)")
+_MD_BOLD_UND = re.compile(r"__([^_\n]+)__")
+_MD_ITAL_UND = re.compile(r"(?<![A-Za-z_])_([^_\n]+)_(?![A-Za-z_])")
+_MD_HEADER = re.compile(r"^\s*#{1,6}\s+", re.MULTILINE)
+_MD_BULLET = re.compile(r"^\s*[-*+]\s+", re.MULTILINE)
+_MD_NUMBERED = re.compile(r"^\s*\d+\.\s+", re.MULTILINE)
+_MD_HRULE = re.compile(r"^\s*-{3,}\s*$", re.MULTILINE)
+_MD_BLOCKQUOTE = re.compile(r"^\s*>\s?", re.MULTILINE)
+_TABLE_PIPE = re.compile(r"\s*\|\s*")
+_EXTRA_WS = re.compile(r"[ \t]+")
+_EXTRA_NEWLINES = re.compile(r"\n{3,}")
+
+
+def clean_for_speech(text: str) -> str:
+    """Strip markdown/code formatting so TTS doesn't speak symbols.
+    Keeps ChatterBox paralinguistic tags ([laugh], [sigh], ...) intact."""
+    if not text:
+        return ""
+
+    # 1. Fenced code blocks — replace with a brief narration.
+    def _code_sub(m: re.Match) -> str:
+        lang = (m.group(1) or "").strip()
+        return f" (a code snippet in {lang}) " if lang else " (a code snippet) "
+    out = _CODE_FENCE.sub(_code_sub, text)
+
+    # 2. Strip inline-code backticks, keep the token.
+    out = _INLINE_CODE.sub(r"\1", out)
+
+    # 3. Markdown links → just the link text.
+    out = _MD_LINK.sub(r"\1", out)
+
+    # 4. Bold / italic markers.
+    out = _MD_BOLD.sub(r"\1", out)
+    out = _MD_BOLD_UND.sub(r"\1", out)
+    out = _MD_ITAL_STAR.sub(r"\1", out)
+    out = _MD_ITAL_UND.sub(r"\1", out)
+
+    # 5. Headings, bullets, numbered lists, horizontal rules, blockquotes.
+    out = _MD_HEADER.sub("", out)
+    out = _MD_BULLET.sub("", out)
+    out = _MD_NUMBERED.sub("", out)
+    out = _MD_HRULE.sub("", out)
+    out = _MD_BLOCKQUOTE.sub("", out)
+
+    # 6. Tables — drop pipes, keep cell text.
+    out = _TABLE_PIPE.sub(" ", out)
+
+    # 7. Meme flags out, paralinguistic tags stay.
+    out = _MEME_FLAG_RE.sub("", out)
+    # Also strip partial/unclosed flags that got cut by a mid-stream split —
+    # without this, a sentence can end right inside `[NOVEL: some ` and the
+    # opener gets spoken aloud.
+    out = re.sub(
+        r"\[(?:NOVEL|REPEAT|CONTRADICTION|SALIENT|HIGH-STAKES|ASSOCIATED|IDENTITY)[^\]]*$",
+        "",
+        out,
+        flags=re.IGNORECASE,
+    )
+
+    # 8. Stray markup chars that slipped through.
+    out = out.replace("```", " ")
+
+    # 9. Normalise whitespace.
+    out = _EXTRA_WS.sub(" ", out)
+    out = _EXTRA_NEWLINES.sub("\n\n", out)
+    return out.strip()
+
+
 _SENTENCE_END = re.compile(r"([.!?]+[\)\"']?)(\s+|$)")
 
 

@@ -188,6 +188,71 @@ def test_extract_text_only_handles_all_shapes():
     ]) == "keep"
 
 
+def test_clean_for_speech_strips_markdown_bold_italic():
+    from tui_common import clean_for_speech
+    assert clean_for_speech("**bold** and *ital*") == "bold and ital"
+    assert clean_for_speech("__bold__ and _ital_") == "bold and ital"
+
+
+def test_clean_for_speech_strips_inline_code():
+    from tui_common import clean_for_speech
+    assert clean_for_speech("run `git status` then check") == "run git status then check"
+
+
+def test_clean_for_speech_replaces_code_fence_with_narration():
+    from tui_common import clean_for_speech
+    out = clean_for_speech("Here's an example:\n```python\ndef foo(): return 42\n```\ndone")
+    # The raw code shouldn't be present; a short narration replaces it.
+    assert "def foo" not in out
+    assert "code snippet" in out
+    assert "python" in out
+
+
+def test_clean_for_speech_strips_headers_bullets_hrules():
+    from tui_common import clean_for_speech
+    text = "## Title\n\n- one\n- two\n\n---\n\nbody"
+    out = clean_for_speech(text)
+    # Headers/bullets/rules vanish; content stays.
+    assert "Title" in out
+    assert "one" in out and "two" in out
+    assert "#" not in out
+    assert "- " not in out
+
+
+def test_clean_for_speech_strips_meme_flags():
+    from tui_common import clean_for_speech
+    out = clean_for_speech("Hello. [NOVEL: Himanshu said hi] Have a good day.")
+    assert "[NOVEL" not in out
+    assert "Hello" in out
+    assert "good day" in out
+
+
+def test_clean_for_speech_strips_partial_flag_opening():
+    """If a sentence got cut mid-stream right inside a flag opening, the
+    `[NOVEL: ...` fragment must not reach TTS."""
+    from tui_common import clean_for_speech
+    out = clean_for_speech("answer here. [NOVEL: some fact that continues")
+    assert "[NOVEL" not in out
+    assert "answer here." in out
+
+
+def test_clean_for_speech_keeps_paralinguistic_tags():
+    """ChatterBox Turbo tags must survive — they're speech instructions."""
+    from tui_common import clean_for_speech
+    for tag in ["[laugh]", "[sigh]", "[gasp]", "[chuckle]",
+                "[cough]", "[sniff]", "[groan]", "[clear throat]"]:
+        out = clean_for_speech(f"Okay {tag} that's funny.")
+        assert tag in out, f"tag {tag} was stripped"
+
+
+def test_clean_for_speech_strips_markdown_link_syntax():
+    from tui_common import clean_for_speech
+    out = clean_for_speech("See [the docs](https://example.com) for more.")
+    assert "the docs" in out
+    assert "https" not in out
+    assert "[" not in out and "]" not in out
+
+
 def test_strip_meme_flags_removes_all_meme_flags():
     from tui_common import strip_meme_flags
 

@@ -66,7 +66,7 @@ from utils import env  # noqa: E402
 from tui_common import (  # noqa: E402
     BASE_CSS, ChatMessage, StatusBar, TranscriptItem,
     read_identity, transcript_entries, parse_transcript,
-    strip_meme_flags, split_sentence, log_error,
+    strip_meme_flags, clean_for_speech, split_sentence, log_error,
 )
 
 env.load_dotenv(ROOT / ".env")
@@ -539,12 +539,15 @@ class SamanthaTUI(App):
                         break
                     tts_buffer = remainder
                     if self.voice:
-                        spoken = strip_meme_flags(reflection.strip_thinking(sentence))
+                        # clean_for_speech strips markdown, code fences,
+                        # memory flags, and partial flag openings so TTS
+                        # never speaks symbols or memory-system tags.
+                        spoken = clean_for_speech(reflection.strip_thinking(sentence))
                         if spoken and spoken not in spoken_so_far:
                             self.voice.speak(spoken)
                             spoken_so_far += spoken + " "
             if tts_buffer.strip() and self.voice:
-                spoken = strip_meme_flags(reflection.strip_thinking(tts_buffer))
+                spoken = clean_for_speech(reflection.strip_thinking(tts_buffer))
                 if spoken and spoken not in spoken_so_far:
                     self.voice.speak(spoken)
             reply = reflection.strip_thinking(full_reply)
