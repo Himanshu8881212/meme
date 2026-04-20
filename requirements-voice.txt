@@ -1,0 +1,18 @@
+# Voice-first TUI extras (Mac / Apple Silicon only).
+# Install in addition to requirements.txt.
+-r requirements.txt
+
+# Apple-Silicon ML
+mlx>=0.20.0
+mlx-audio>=0.2.0
+parakeet-mlx>=0.1.0
+
+# Audio I/O
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# Textual for the voice UI
+textual>=0.47.0
+
+# Push-to-talk keyboard hook
+pynput>=1.7.6

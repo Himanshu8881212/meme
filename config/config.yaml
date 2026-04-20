@@ -18,6 +18,12 @@ providers:
   ollama:
     base_url: http://localhost:11434/v1
     api_key_env: OLLAMA_API_KEY
+  # LM Studio — local inference on Mac/Metal via the LM Studio app.
+  # Start a model in LM Studio, enable its server (defaults to port 1234),
+  # then flip `models.model1.provider` below to `lmstudio` for offline chat.
+  lmstudio:
+    base_url: http://localhost:1234/v1
+    api_key_env: lm-studio   # any string; LM Studio ignores auth
   echo:
     base_url: null
     api_key_env: null

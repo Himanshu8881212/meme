@@ -27,8 +27,13 @@ vault/_identity/*
 vault/_transcripts/*
 vault/_meta/*
 vault/_archive/
+vault/.obsidian/
 # ...but keep the folder structure via .gitkeep
 !vault/**/.gitkeep
+
+# Personal voice-clone reference — users bring their own
+reference.wav
+*.wav
 
 # Benchmark datasets (users clone / download these themselves)
 bench/MemBench/

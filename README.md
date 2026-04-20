@@ -79,12 +79,35 @@ Open the `vault/` folder in Obsidian to watch the mind take shape.
 
 ## Three ways to use it
 
-### 1. Interactive TUI
+### 1. Interactive TUI — keyboard
 ```bash
 python tui.py
 ```
-The main way to talk with the assistant. Agentic chat with multi-hop
-memory tools. Auto-saves on exit. `/help` for commands.
+Agentic chat with multi-hop memory tools. Auto-saves on exit.
+`/help` for commands.
+
+### 1b. Voice-first TUI — Mac / Apple Silicon
+```bash
+pip install -r requirements-voice.txt
+python voice_tui.py --ref-audio reference.wav
+```
+Hold **OPTION** to talk, release to send. Everything is the same memory
+pipeline — voice is just another modality:
+
+- **STT + TTS always local** (parakeet-mlx + mlx-audio ChatterBox on Metal).
+- **Chat model is Model 1** — flip one line in `config.yaml` to switch:
+
+  ```yaml
+  models:
+    model1:
+      provider: mistral     # cloud via API (needs MISTRAL_API_KEY)
+      #         lmstudio    # local, via LM Studio on :1234
+      #         ollama      # local, via Ollama on :11434
+      model: magistral-medium-latest
+  ```
+
+Point `--ref-audio` at your own `.wav` for voice cloning. One system,
+same vault, same persona — now with a voice.
 
 ### 2. MCP server — plug it into any chat client
 ```bash
@@ -253,7 +276,8 @@ Every test uses an offline `echo` backend — no API keys required.
 
 ```
 main.py             CLI: init, decay, monitor, meta, ingest, index
-tui.py              Interactive TUI
+tui.py              Interactive TUI (keyboard)
+voice_tui.py        Voice-first TUI (Mac/Metal) — push-to-talk
 mcp_server.py       MCP stdio server (7 tools)
 
 config/config.yaml  Providers, models, thresholds
