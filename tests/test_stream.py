@@ -131,6 +131,41 @@ def test_chat_stream_skips_magistral_thinking_chunks(config, monkeypatch):
     assert "here is the answer." in joined
 
 
+def test_sanitize_messages_drops_empty_assistants():
+    """Mistral's 400 'Assistant message must have content or tool_calls'
+    used to poison sessions when magistral streamed only reasoning. The
+    API layer defensively filters those out."""
+    from core.reflection import _sanitize_messages
+
+    msgs = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": ""},          # should be dropped
+        {"role": "user", "content": "you there?"},
+        {"role": "assistant", "content": "   "},       # whitespace — dropped
+        {"role": "user", "content": "hello??"},
+    ]
+    out = _sanitize_messages(msgs)
+    roles = [m["role"] for m in out]
+    assert roles == ["user", "user", "user"]
+
+
+def test_sanitize_messages_keeps_tool_calls():
+    """Assistant messages with tool_calls but empty content ARE valid —
+    they're how tool-calling models request a tool. Must keep them."""
+    from core.reflection import _sanitize_messages
+
+    msgs = [
+        {"role": "user", "content": "what's the tag count?"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "count_nodes_by_tag", "arguments": "{}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "3"},
+    ]
+    out = _sanitize_messages(msgs)
+    assert len(out) == 3  # tool-call-bearing assistant kept
+
+
 def test_extract_text_only_handles_all_shapes():
     """_extract_text_only is the gate that prevents reasoning leaks."""
     from core.reflection import _extract_text_only

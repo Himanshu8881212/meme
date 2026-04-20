@@ -423,6 +423,14 @@ class MemeTUI(App):
             log_path = log_error(VAULT, "chat", exc)
             reply = f"(model error: {exc}\n\nfull trace → {log_path})"
 
+        if not reply.strip():
+            reply = "…"
+            self.call_from_thread(
+                self._system_message,
+                "(the model returned nothing — likely ran out of tokens mid-reasoning. "
+                "Try again or ask a smaller question.)",
+            )
+
         self.messages.append({"role": "assistant", "content": reply})
         self.transcript.append(f"## ASSISTANT\n{reply}")
         self.call_from_thread(self._finish_ai_message, reply)

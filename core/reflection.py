@@ -343,6 +343,26 @@ def _echo(system: str, messages: list[dict[str, str]]) -> str:
     )
 
 
+def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Mistral (and strict OpenAI-compat providers) reject assistant
+    messages with no content AND no tool_calls. This can happen if a prior
+    turn's stream produced only reasoning tokens (all dropped by text-only
+    extraction) — the empty reply then poisons subsequent turns with 400s.
+
+    Drop those empty assistant messages defensively at the API boundary.
+    """
+    out = []
+    for m in messages:
+        if (
+            m.get("role") == "assistant"
+            and not (m.get("content") or "").strip()
+            and not m.get("tool_calls")
+        ):
+            continue
+        out.append(m)
+    return out
+
+
 def _invoke(role: str, system: str, messages: list[dict[str, str]],
             config: dict[str, Any], max_tokens: int) -> str:
     provider_name, provider, model = _resolve(role, config)
@@ -351,13 +371,14 @@ def _invoke(role: str, system: str, messages: list[dict[str, str]],
 
     client = _get_client(provider_name, provider)
     retries, backoff = _retry_params(config)
+    safe_messages = _sanitize_messages(list(messages))
     resp = _create_with_retry(
         client,
         max_retries=retries,
         backoff_base_sec=backoff,
         model=model,
         max_tokens=max_tokens,
-        messages=[{"role": "system", "content": system}, *messages],
+        messages=[{"role": "system", "content": system}, *safe_messages],
     )
     return _normalize_content(resp.choices[0].message.content)
 
@@ -387,13 +408,14 @@ def chat_stream(
     client = _get_client(provider_name, provider)
     retries, backoff = _retry_params(config)
 
+    safe_messages = _sanitize_messages(list(messages))
     last_exc: Exception | None = None
     for attempt in range(retries):
         try:
             stream = client.chat.completions.create(
                 model=model,
                 max_tokens=max_tokens,
-                messages=[{"role": "system", "content": system}, *messages],
+                messages=[{"role": "system", "content": system}, *safe_messages],
                 stream=True,
             )
             for event in stream:

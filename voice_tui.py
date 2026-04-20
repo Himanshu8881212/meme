@@ -552,6 +552,16 @@ class SamanthaTUI(App):
             log_path = log_error(VAULT, "chat_stream", exc)
             reply = f"(model error: {exc}\n\nfull trace → {log_path})"
 
+        # Don't poison history with an empty assistant message — Mistral
+        # rejects those and the next turn fails with a 400.
+        if not reply.strip():
+            reply = "…"  # placeholder so history stays valid
+            self.call_from_thread(
+                self._system_message,
+                "(the model returned nothing — probably ran out of tokens while "
+                "reasoning. Try again or ask a smaller question.)",
+            )
+
         self.messages.append({"role": "assistant", "content": reply})
         self.transcript.append(f"## ASSISTANT\n{reply}")
         self.call_from_thread(self._finish_ai_message, reply)
