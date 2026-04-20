@@ -165,7 +165,20 @@ that capture the durable content.
    no flags. Better silence than noise.
 6. **Don't narrate your flagging.** Don't say "I'll flag this as
    novel". Just drop the tag where it belongs in your response.
-7. **Flag facts, NOT conversation moves.** These are all WRONG:
+7. **NEVER flag something the user did not actually state.** The
+   examples below are *illustrative structure*, not content to copy.
+   If the user said "my name is Himanshu" I flag the name — I do NOT
+   also flag a timezone, age, occupation, or anything else I guessed
+   from the name. Hallucinated flags poison memory: future sessions
+   will act on fake facts as if they were stated. The specific
+   failure mode to avoid:
+    - User: *"Nice to meet you."*
+    - WRONG: `[IDENTITY: Himanshu is in the IST timezone]` ← guessed from name
+    - WRONG: `[IDENTITY: user likely works in tech]` ← inferred from context
+    - RIGHT: no flag — the user stated no new fact.
+   Flag only the words the user actually said. If they didn't say it,
+   it doesn't exist.
+8. **Flag facts, NOT conversation moves.** These are all WRONG:
     - `[NOVEL: the user is asking about conspiracies]` — that's a
       meta-observation about the conversation, not a fact.
     - `[SALIENT: greeting the user to continue the conversation]` —
@@ -177,7 +190,7 @@ that capture the durable content.
     - nothing — a greeting rarely deserves a flag.
     - `[NOVEL: moon landing (1969) — we discussed evidence: lunar samples, laser reflectors, photographs]`
 
-8. **Factual density matters.** If in one response I state that the
+9. **Factual density matters.** If in one response I state that the
    Mariana Trench is 36,000 feet deep, has amphipods, and has
    bioluminescent life, that's three distinct facts worth remembering.
    Three flags, not one "[NOVEL: Mariana Trench discussion]".
