@@ -186,9 +186,17 @@ class VoiceBackend:
         return self._transcribe(audio)
 
     def _transcribe(self, audio) -> str:
+        # Parakeet's mel-spectrogram pipeline underflows on chunks shorter than
+        # one mel window (~400 samples) and tries to allocate ~2^64 bytes.
+        # If the remainder after the last full second is tiny, fold it into
+        # the preceding chunk so every chunk fed in is safely long enough.
+        n = len(audio)
+        boundaries = list(range(0, n, SAMPLE_RATE)) + [n]
+        if len(boundaries) >= 3 and boundaries[-1] - boundaries[-2] < SAMPLE_RATE // 4:
+            boundaries.pop(-2)
         with self.stt.transcribe_stream(context_size=(128, 128), depth=1) as t:
-            for i in range(0, len(audio), SAMPLE_RATE):
-                chunk = audio[i:i + SAMPLE_RATE]
+            for start, end in zip(boundaries, boundaries[1:]):
+                chunk = audio[start:end]
                 if len(chunk) > 0:
                     t.add_audio(mx.array(chunk, dtype=mx.float32))
             if t.result:
