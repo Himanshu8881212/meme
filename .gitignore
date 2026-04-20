@@ -1,0 +1,42 @@
+# Secrets — never commit API keys
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Personal vault content — each user generates their own via `python main.py init`
+vault/entities/*
+vault/concepts/*
+vault/decisions/*
+vault/episodes/*
+vault/tensions/*
+vault/questions/*
+vault/procedures/*
+vault/_identity/*
+vault/_transcripts/*
+vault/_meta/*
+vault/_archive/
+# ...but keep the folder structure via .gitkeep
+!vault/**/.gitkeep
+
+# Benchmark datasets (users clone / download these themselves)
+bench/MemBench/
+bench/MemoryAgentBench/
+bench/longmemeval_*.json
+
+# Test artifacts
+/tmp/
+/.tmp/
+*.log
+.DS_Store

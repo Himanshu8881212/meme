@@ -1,0 +1,97 @@
+vault_path: ./vault
+
+# Universal provider layer — anything speaking the OpenAI-compatible
+# /v1/chat/completions protocol works. Flip `providers.<name>.base_url`
+# to route through OpenAI, Mistral, Ollama, OpenRouter, vLLM, LM Studio,
+# Anthropic-via-proxy, etc. The `echo` provider is built in and never
+# calls out — use it for tests and offline demos.
+providers:
+  mistral:
+    base_url: https://api.mistral.ai/v1
+    api_key_env: MISTRAL_API_KEY
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+  ollama:
+    base_url: http://localhost:11434/v1
+    api_key_env: OLLAMA_API_KEY
+  echo:
+    base_url: null
+    api_key_env: null
+
+# Each role picks a provider + model id. Default: Mistral, three tiers.
+models:
+  # All three tiers on magistral-medium (the largest magistral reasoning model —
+  # magistral-large doesn't exist in Mistral's catalog as of this writing).
+  model1:
+    provider: mistral
+    model: magistral-medium-latest
+  routine:
+    provider: mistral
+    model: magistral-medium-latest
+  deep:
+    provider: mistral
+    model: magistral-medium-latest
+
+retrieval:
+  entry_points: 8
+  hops: 2
+  dense_vault_threshold: 1000
+  # Scoring weights must sum to 1.0. `body_bm25` is a lexical score over the
+  # full node body — fixes the "answer is in the body but not the title"
+  # failure mode that pure graph retrieval can't address.
+  weights:
+    tag_overlap: 0.30
+    keyword_in_title: 0.20
+    body_bm25: 0.30
+    decay_weight: 0.10
+    recency: 0.10
+
+decay:
+  lambda: 0.05
+  archive_threshold: 0.10
+
+monitor:
+  hub_backlink_limit: 20
+  tag_vocabulary_limit: 150
+  orphan_ratio_limit: 0.10
+  archived_ratio_limit: 0.30
+  tension_age_days_limit: 90
+  # Nodes with body shorter than this (after stripping headings/whitespace)
+  # are considered empty stubs and deleted by /meta's cleanup phase.
+  min_body_chars: 20
+
+reflection:
+  min_flags_for_reflection: 1
+  # Recovery thresholds — when Model 1 emits 0 flags but the transcript is
+  # substantive, trigger reflection anyway. Without recovery, rich technical
+  # discussions vaporize.
+  recovery_min_chars: 150
+  recovery_min_user_turns: 2
+  # When a new node's title shares this fraction of meaningful tokens with
+  # an existing node's title, a duplicate warning is attached to the write.
+  # Higher = stricter (fewer warnings). Lower = more cautious.
+  duplicate_similarity_threshold: 0.5
+  # Max tool-call rounds in /meta before forcing a final answer.
+  max_tool_rounds: 8
+  # Retry with exponential backoff on rate-limit errors from the provider.
+  retry:
+    max_retries: 3
+    backoff_base_sec: 2.0
+
+session:
+  max_context_files: 20
+  history_window: 12
+  # Agentic Model 1: let the chat model iteratively call memory tools during a
+  # turn. Enables multi-hop answers ("citizenship of spouse of author of X")
+  # that a single retrieval can't produce. Costs a few extra API calls per
+  # complex question; disable for fast/cheap mode.
+  agentic_model1: true
+  max_tool_rounds: 5
+
+mcp:
+  server_name: memory-system
+  default_search_limit: 8
