@@ -66,7 +66,7 @@ from utils import env  # noqa: E402
 from tui_common import (  # noqa: E402
     BASE_CSS, ChatMessage, StatusBar, TranscriptItem,
     read_identity, transcript_entries, parse_transcript,
-    strip_meme_flags, split_sentence,
+    strip_meme_flags, split_sentence, log_error,
 )
 
 env.load_dotenv(ROOT / ".env")
@@ -549,7 +549,8 @@ class SamanthaTUI(App):
                     self.voice.speak(spoken)
             reply = reflection.strip_thinking(full_reply)
         except Exception as exc:
-            reply = f"(model error: {exc})"
+            log_path = log_error(VAULT, "chat_stream", exc)
+            reply = f"(model error: {exc}\n\nfull trace → {log_path})"
 
         self.messages.append({"role": "assistant", "content": reply})
         self.transcript.append(f"## ASSISTANT\n{reply}")

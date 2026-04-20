@@ -243,3 +243,18 @@ def split_sentence(buffer: str) -> tuple[str, str]:
         return "", buffer
     end = match.end()
     return buffer[:end].strip(), buffer[end:]
+
+
+def log_error(vault: Path, source: str, exc: Exception) -> Path:
+    """Append a timestamped error to vault/_meta/errors.log — a persistent
+    record the user can `cat` outside the TUI (since Textual captures
+    the mouse and ordinary terminal copy-paste doesn't work inside it).
+
+    Returns the log path so the caller can surface it in a system message.
+    """
+    log_path = vault / "_meta" / "errors.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(f"\n[{stamp}] {source}\n{type(exc).__name__}: {exc}\n")
+    return log_path
