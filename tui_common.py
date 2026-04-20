@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from rich.markdown import Markdown
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -118,15 +119,29 @@ TranscriptItem.--highlight { border-left: solid #c9a0ff; background: #1c2128; }
 # Widgets
 # --------------------------------------------------------------------------
 class ChatMessage(Static):
-    """A single chat bubble — user / ai / system."""
+    """A single chat bubble — user / ai / system.
+
+    AI and system messages render markdown so the model's `**bold**`,
+    headers, code blocks, and lists appear formatted rather than literal.
+    User messages stay plain text.
+    """
 
     def __init__(self, content: str, kind: str = "user"):
-        super().__init__(content)
         self.kind = kind
+        super().__init__(self._render(content))
         self.add_class(f"{kind}-message")
 
+    def _render(self, content: str):
+        if not content:
+            return ""
+        if self.kind in ("ai", "system"):
+            # Rich's Markdown handles partial / streaming text gracefully —
+            # an open code fence mid-stream just renders as code-in-progress.
+            return Markdown(content, code_theme="monokai", inline_code_theme="monokai")
+        return content  # user messages: plain text
+
     def update_content(self, content: str) -> None:
-        self.update(content)
+        self.update(self._render(content))
 
 
 class TranscriptItem(ListItem):
