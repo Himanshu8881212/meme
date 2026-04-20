@@ -65,48 +65,49 @@ def test_chat_stream_skips_none_content(config, monkeypatch):
 
 def test_sentence_splitter():
     """voice_tui chunks TTS at sentence boundaries to avoid mid-clause cuts."""
-    import voice_tui as vt
+    from tui_common import split_sentence
 
-    sent, rem = vt._split_sentence("Hello world. How are")
+    sent, rem = split_sentence("Hello world. How are")
     assert sent == "Hello world."
     assert rem == "How are"
 
-    sent, rem = vt._split_sentence("no terminator yet")
+    sent, rem = split_sentence("no terminator yet")
     assert sent == ""
     assert rem == "no terminator yet"
 
     # Multiple terminators — splits at first.
-    sent, rem = vt._split_sentence("First one! Then the second?")
+    sent, rem = split_sentence("First one! Then the second?")
     assert sent == "First one!"
 
     # Question mark.
-    sent, _ = vt._split_sentence("What? Really.")
+    sent, _ = split_sentence("What? Really.")
     assert sent == "What?"
 
     # Handles closing quote / paren after terminator.
-    sent, _ = vt._split_sentence('She said "hi." Then left.')
+    sent, _ = split_sentence('She said "hi." Then left.')
     assert 'She said "hi."' == sent
 
 
-def test_clean_for_tts_preserves_paralinguistic():
+def test_strip_meme_flags_preserves_paralinguistic():
     """ChatterBox Turbo tags like [laugh] must survive — they're speech
     instructions, not memory flags to strip."""
-    import voice_tui as vt
+    from tui_common import strip_meme_flags
 
-    out = vt._clean_for_tts("[laugh] Nice one. [NOVEL: Ryan likes jokes]")
+    out = strip_meme_flags("[laugh] Nice one. [NOVEL: Ryan likes jokes]")
     assert "[laugh]" in out
     assert "[NOVEL" not in out
     assert "Nice one" in out
 
 
-def test_clean_for_tts_strips_all_meme_flags():
-    import voice_tui as vt
+def test_strip_meme_flags_removes_all_meme_flags():
+    from tui_common import strip_meme_flags
+
     cases = [
         "[NOVEL: x]", "[REPEAT: y]", "[CONTRADICTION: z]",
         "[SALIENT: a]", "[HIGH-STAKES: b]", "[ASSOCIATED: c]", "[IDENTITY: d]",
     ]
     text = " ".join(cases) + " keep this"
-    out = vt._clean_for_tts(text)
+    out = strip_meme_flags(text)
     assert "keep this" in out
     for flag in cases:
         assert flag not in out
