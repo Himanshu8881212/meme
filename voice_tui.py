@@ -392,7 +392,18 @@ class SamanthaTUI(App):
             self._system_message(f"deleted transcript — {name}")
 
     def action_new_session(self) -> None:
-        self._save_current_session()
+        if self.session and self.transcript:
+            self._system_message("saving current session — reflecting...")
+            self._save_then_reset()
+        else:
+            self._reset_for_new_session()
+
+    @work(thread=True)
+    def _save_then_reset(self) -> None:
+        self._save_and_report()
+        self.call_from_thread(self._reset_for_new_session)
+
+    def _reset_for_new_session(self) -> None:
         self._chat_container.remove_children()
         self.session = None
         self.messages = []
@@ -465,6 +476,12 @@ class SamanthaTUI(App):
             self.call_from_thread(self._set_status, "")
             return
         self.call_from_thread(self._set_status, "")
+        # Spoken exit phrase — treat same as typed "bye".
+        norm = text.lower().strip().rstrip(".!?,")
+        if norm in ("bye", "goodbye", "quit", "exit", "bye bye"):
+            self.call_from_thread(self._user_message, text)
+            self.call_from_thread(self.action_quit)
+            return
         self.call_from_thread(self._send, text)
 
     # ----- chat pipeline ----------------------------------------------
@@ -573,25 +590,52 @@ class SamanthaTUI(App):
 
     # ----- lifecycle --------------------------------------------------
 
-    def _save_current_session(self) -> None:
+    def action_quit(self) -> None:
+        """Exit — but first run reflection (visibly) if there's a session to save."""
+        if self.session and self.transcript:
+            self._system_message("saving session — extracting flags and reflecting...")
+            self._save_then_exit()
+        else:
+            self._do_shutdown_and_exit()
+
+    @work(thread=True)
+    def _save_then_exit(self) -> None:
+        self._save_and_report()
+        import time as _t
+        _t.sleep(2.0)  # let user read the summary
+        self.call_from_thread(self._do_shutdown_and_exit)
+
+    def _save_and_report(self) -> None:
+        """Run session_mgr.end and post a system message with the result.
+        Called both from quit and from new-session. Safe to run in a worker."""
         if not self.session or not self.transcript:
             return
         try:
-            session_mgr.end(
+            result = session_mgr.end(
                 session_output="\n".join(self.transcript),
                 session_meta=self.session,
                 config=CONFIG,
                 project_root=ROOT,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            self.call_from_thread(self._system_message, f"save failed: {exc}")
+            return
+        flags = result.get("flags_found", 0)
+        writes = result.get("writes") or []
+        mode = " (recovery)" if result.get("recovery_mode") else ""
+        lines = [f"session saved · flags: {flags} · writes: {len(writes)}{mode}"]
+        for w in writes[:6]:
+            lines.append(f"  {w.get('action', '?')}  {w.get('path', '')}")
+        self.call_from_thread(self._system_message, "\n".join(lines))
+        self.call_from_thread(self._refresh_transcripts)
 
-    def action_quit(self) -> None:
-        self._save_current_session()
+    def _do_shutdown_and_exit(self) -> None:
         if self._pynput_listener:
-            self._pynput_listener.stop()
+            try: self._pynput_listener.stop()
+            except Exception: pass
         if self.voice:
-            self.voice.shutdown()
+            try: self.voice.shutdown()
+            except Exception: pass
         self.exit()
 
 

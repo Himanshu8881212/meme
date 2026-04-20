@@ -185,7 +185,18 @@ class MemeTUI(App):
             self._system_message(f"deleted transcript — {name}")
 
     def action_new_session(self) -> None:
-        self._save_current_session()
+        if self.session and self.transcript:
+            self._system_message("saving current session — reflecting...")
+            self._save_then_reset()
+        else:
+            self._reset_for_new_session()
+
+    @work(thread=True)
+    def _save_then_reset(self) -> None:
+        self._save_and_report()
+        self.call_from_thread(self._reset_for_new_session)
+
+    def _reset_for_new_session(self) -> None:
         self._chat_container.remove_children()
         self.session = None
         self.messages = []
@@ -446,21 +457,41 @@ class MemeTUI(App):
         except Exception as exc:
             self.call_from_thread(self._system_message, f"end error: {exc}")
 
-    def _save_current_session(self) -> None:
+    def action_quit(self) -> None:
+        """Exit — but run reflection visibly first if there's a session."""
+        if self.session and self.transcript:
+            self._system_message("saving session — extracting flags and reflecting...")
+            self._save_then_exit()
+        else:
+            self.exit()
+
+    @work(thread=True)
+    def _save_then_exit(self) -> None:
+        self._save_and_report()
+        import time as _t
+        _t.sleep(2.0)
+        self.call_from_thread(self.exit)
+
+    def _save_and_report(self) -> None:
         if not self.session or not self.transcript:
             return
         try:
-            session_mgr.end(
+            result = session_mgr.end(
                 session_output="\n".join(self.transcript),
                 session_meta=self.session,
                 config=CONFIG, project_root=ROOT,
             )
-        except Exception:
-            pass
-
-    def action_quit(self) -> None:
-        self._save_current_session()
-        self.exit()
+        except Exception as exc:
+            self.call_from_thread(self._system_message, f"save failed: {exc}")
+            return
+        flags = result.get("flags_found", 0)
+        writes = result.get("writes") or []
+        mode = " (recovery)" if result.get("recovery_mode") else ""
+        lines = [f"session saved · flags: {flags} · writes: {len(writes)}{mode}"]
+        for w in writes[:6]:
+            lines.append(f"  {w.get('action', '?')}  {w.get('path', '')}")
+        self.call_from_thread(self._system_message, "\n".join(lines))
+        self.call_from_thread(self._refresh_transcripts)
 
     # ----- chat bubbles ----------------------------------------------
 
