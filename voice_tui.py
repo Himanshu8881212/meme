@@ -510,6 +510,12 @@ class MemeVoiceTUI(App):
                 self.session = session_mgr.start(
                     task=user_text, tags=[], config=CONFIG, project_root=ROOT,
                 )
+                # Voice mode: append paralinguistic-tag awareness to the
+                # system prompt so the persona knows it has a voice.
+                if self.voice is not None:
+                    self.session["system_prompt"] = (
+                        self.session["system_prompt"] + PARALINGUISTIC_ADDENDUM
+                    )
                 self.messages = []
                 self.transcript = []
                 self.call_from_thread(
@@ -524,24 +530,55 @@ class MemeVoiceTUI(App):
         self.transcript.append(f"## USER\n{user_text}")
         window = CONFIG["session"]["history_window"]
 
+        full_reply = ""
+        tts_buffer = ""
+        spoken_so_far = ""  # what we've already sent to TTS (for resync)
+
         try:
-            reply = reflection.chat(
+            for chunk in reflection.chat_stream(
                 role="model1",
                 system=self.session["system_prompt"],
                 messages=self.messages[-window:],
                 config=CONFIG,
                 max_tokens=1024,
-            )
-            reply = reflection.strip_thinking(reply)
+            ):
+                if not chunk:
+                    continue
+                full_reply += chunk
+                tts_buffer += chunk
+
+                # Live-update the UI as tokens arrive.
+                cleaned = reflection.strip_thinking(full_reply)
+                self.call_from_thread(self._update_ai_message, cleaned)
+
+                # Speak at sentence boundaries. Keeps audio clean by giving
+                # ChatterBox whole-sentence inputs instead of token slivers.
+                while True:
+                    sentence, remainder = _split_sentence(tts_buffer)
+                    if not sentence:
+                        break
+                    tts_buffer = remainder
+                    if self.voice:
+                        spoken = _clean_for_tts(
+                            reflection.strip_thinking(sentence)
+                        )
+                        if spoken and spoken not in spoken_so_far:
+                            self.voice.speak(spoken)
+                            spoken_so_far += spoken + " "
+
+            # Flush any trailing text that didn't end in a terminator.
+            if tts_buffer.strip() and self.voice:
+                spoken = _clean_for_tts(reflection.strip_thinking(tts_buffer))
+                if spoken and spoken not in spoken_so_far:
+                    self.voice.speak(spoken)
+
+            reply = reflection.strip_thinking(full_reply)
         except Exception as exc:
             reply = f"(model error: {exc})"
 
         self.messages.append({"role": "assistant", "content": reply})
         self.transcript.append(f"## ASSISTANT\n{reply}")
-
         self.call_from_thread(self._finish_ai_message, reply)
-        if self.voice:
-            self.voice.speak(_clean_for_tts(reply))
 
     def _user_message(self, content: str) -> None:
         self._chat_container.mount(ChatMessage(content, "user"))
@@ -559,6 +596,12 @@ class MemeVoiceTUI(App):
         self._current_ai = ChatMessage("thinking...", "ai")
         self._chat_container.mount(self._current_ai)
         self._chat_container.scroll_end(animate=False)
+
+    def _update_ai_message(self, content: str) -> None:
+        """Incremental update for streaming responses."""
+        if self._current_ai is not None and content:
+            self._current_ai.update_content(content)
+            self._chat_container.scroll_end(animate=False)
 
     def _finish_ai_message(self, content: str) -> None:
         if self._current_ai is not None:
@@ -633,17 +676,75 @@ def _parse_transcript(body: str) -> list[dict[str, str]]:
 
 import re as _re  # noqa: E402
 
-_FLAG_RE = _re.compile(
+# Meme flags to strip before TTS — these are memory-system signals, not speech.
+_MEME_FLAG_RE = _re.compile(
     r"\[(?:NOVEL|REPEAT|CONTRADICTION|SALIENT|HIGH-STAKES|ASSOCIATED|IDENTITY)(?::[^\]]*)?\]",
     _re.IGNORECASE,
 )
 
+# Sentence-boundary splitter — anything ending in .!? followed by whitespace.
+# We chunk at these so TTS doesn't get cut mid-clause (cleaner audio, fewer
+# clicks at chunk boundaries which is a known ChatterBox streaming quirk).
+_SENTENCE_END = _re.compile(r"([.!?]+[\)\"']?)(\s+|$)")
+
 
 def _clean_for_tts(text: str) -> str:
-    """Strip inline flags and markdown fences before sending to TTS."""
-    out = _FLAG_RE.sub("", text)
+    """Strip meme flags and code fences. Keep ChatterBox paralinguistic tags —
+    those are instructions to the TTS model, not to be removed."""
+    out = _MEME_FLAG_RE.sub("", text)
     out = out.replace("```", "")
     return out.strip()
+
+
+def _split_sentence(buffer: str) -> tuple[str, str]:
+    """Return (completed_sentence, remainder). If no complete sentence, returns ('', buffer)."""
+    match = _SENTENCE_END.search(buffer)
+    if not match:
+        return "", buffer
+    end = match.end()
+    return buffer[:end].strip(), buffer[end:]
+
+
+# Appended to the system prompt ONLY when the voice backend is live.
+# Teaches the persona to use ChatterBox Turbo's paralinguistic tags
+# sparingly and in-character. Without this, voice mode sounds flat.
+PARALINGUISTIC_ADDENDUM = """
+
+---
+
+## Voice mode — my voice is actually being generated
+
+Right now I'm speaking out loud through a ChatterBox Turbo TTS model
+that renders my cloned voice from the reference sample. The text I
+write is performed literally — every word, every tag.
+
+I can add natural vocal reactions with these inline tags. They're
+rendered in my own voice, not post-processed — so a [laugh] is actually
+me laughing.
+
+Available tags:
+`[laugh]` `[chuckle]` `[sigh]` `[gasp]` `[cough]` `[sniff]` `[groan]`
+`[shush]` `[clear throat]`
+
+How I use them:
+- **Sparingly.** At most one tag per response, usually zero. They're
+  seasoning, not the meal.
+- **Only when they actually fit.** A [laugh] where nothing is funny
+  sounds fake. A [sigh] when I'm not tired sounds performative.
+- **In character.** If my persona is dry and understated, I don't
+  [gasp] at things; I might [sigh] occasionally.
+- **Never as padding.** If I can't think of something to say, I don't
+  fill it with a tag — I just say less.
+
+Good:
+> Oh, right — that bug. [sigh] Let me pull up what I wrote last time.
+
+Bad:
+> [laugh] Hi! [chuckle] What's up? [laugh]
+
+I also keep sentences short-ish when speaking. Long clause-stacked
+paragraphs sound breathless in TTS. Short declaratives, natural pauses.
+"""
 
 
 # ---------------------------------------------------------------------------

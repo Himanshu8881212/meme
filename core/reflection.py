@@ -338,6 +338,55 @@ def chat(role: str, system: str, messages: list[dict[str, str]],
     return _invoke(role, system, messages, config, max_tokens)
 
 
+def chat_stream(
+    role: str,
+    system: str,
+    messages: list[dict[str, str]],
+    config: dict[str, Any],
+    max_tokens: int = 4096,
+):
+    """Yield response text chunks as they arrive from the provider.
+
+    Used by voice_tui.py so TTS can start speaking before the full answer
+    is generated. On the echo backend, yields the whole response at once.
+    """
+    provider_name, provider, model = _resolve(role, config)
+    if provider_name == "echo":
+        yield _echo(system, messages)
+        return
+
+    client = _get_client(provider_name, provider)
+    retries, backoff = _retry_params(config)
+
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            stream = client.chat.completions.create(
+                model=model,
+                max_tokens=max_tokens,
+                messages=[{"role": "system", "content": system}, *messages],
+                stream=True,
+            )
+            for event in stream:
+                if not event.choices:
+                    continue
+                delta = event.choices[0].delta
+                content = getattr(delta, "content", None)
+                if content is None:
+                    continue
+                # Magistral occasionally hands us a list of parts mid-stream;
+                # normalize so the caller only ever sees a string.
+                yield _normalize_content(content)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if not _is_rate_limited(exc) or attempt == retries - 1:
+                raise
+            time.sleep(backoff * (2 ** attempt))
+    if last_exc is not None:
+        raise last_exc
+
+
 def _model1_tool_dispatch(
     vault: Path, name: str, args: dict[str, Any], config: dict[str, Any],
 ) -> str:
