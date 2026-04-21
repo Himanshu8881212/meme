@@ -14,9 +14,11 @@ STT (parakeet-mlx) and TTS (mlx-audio ChatterBox) are always local.
 """
 from __future__ import annotations
 
+import base64
 import os
 import sys
 import threading
+import time
 import queue
 import warnings
 from pathlib import Path
@@ -48,6 +50,11 @@ try:
     HAS_PYNPUT = True
 except Exception:
     HAS_PYNPUT = False
+try:
+    import cv2
+    HAS_CV2 = True
+except Exception:
+    HAS_CV2 = False
 sys.stderr = _stderr
 
 from textual.app import App, ComposeResult
@@ -67,6 +74,7 @@ from tui_common import (  # noqa: E402
     BASE_CSS, ChatMessage, StatusBar, TranscriptItem,
     read_identity, transcript_entries, parse_transcript,
     strip_meme_flags, clean_for_speech, split_sentence, log_error,
+    copy_to_clipboard,
 )
 
 env.load_dotenv(ROOT / ".env")
@@ -225,6 +233,160 @@ class VoiceBackend:
                 pass
 
 
+# ---------------------------------------------------------------------------
+# Video backend — camera frames for "hold ⌘ to see" mode.
+# ---------------------------------------------------------------------------
+def probe_cameras(max_index: int = 4) -> list[dict]:
+    """Try each camera index and return what actually answers.
+
+    Needed on macOS because Continuity Camera puts an iPhone (if paired)
+    at index 0 and demotes the MacBook's FaceTime HD to index 1 — so a
+    naive `VideoCapture(0)` grabs the phone and leaves the laptop LED
+    dark. Run this at startup so the user can pick the right index.
+    """
+    if not HAS_CV2:
+        return []
+    backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
+    out: list[dict] = []
+    for i in range(max_index):
+        cap = cv2.VideoCapture(i, backend)
+        if not cap or not cap.isOpened():
+            if cap is not None:
+                try: cap.release()
+                except Exception: pass
+            continue
+        # Read a few frames so exposure / warm-up finishes before we grab
+        # the resolution — AVFoundation returns 0x0 if we query too early.
+        w = h = 0
+        for _ in range(10):
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                h, w = frame.shape[:2]
+                break
+            time.sleep(0.05)
+        try: cap.release()
+        except Exception: pass
+        if w and h:
+            out.append({"index": i, "width": w, "height": h})
+    return out
+
+
+class VideoBackend:
+    """Captures camera frames on a background thread while push-to-see is
+    held, then returns a handful of evenly-spaced base64-encoded JPEG frames
+    suitable for Mistral's multimodal `image_url` content parts."""
+
+    def __init__(self, camera_index: int = 0, target_width: int = 768,
+                 capture_fps: int = 8):
+        self.camera_index = camera_index
+        self.target_width = target_width
+        self.capture_interval = 1.0 / max(1, capture_fps)
+        self.cap = None
+        self.frames: list = []
+        self.is_recording = False
+        self.lock = threading.Lock()
+        self.thread: threading.Thread | None = None
+
+    def start_recording(self) -> tuple[bool, str]:
+        """Try to open the camera and start the capture thread.
+        Returns (ok, reason). `reason` is a human-readable hint on failure."""
+        if not HAS_CV2:
+            return False, "opencv-python not installed"
+        if self.is_recording:
+            return False, "already recording"
+        # On macOS the default backend often silently fails; AVFoundation is
+        # the one that actually talks to the camera kext.
+        backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
+        self.cap = cv2.VideoCapture(self.camera_index, backend)
+        if not self.cap or not self.cap.isOpened():
+            self.cap = None
+            return False, (
+                "camera open failed — check that YOUR TERMINAL app "
+                "(not Python) has Camera permission in System Settings → "
+                "Privacy & Security → Camera"
+            )
+        # Warm-up: AVFoundation returns frames immediately after open but
+        # the first ~30 are BLACK (all zeros) while auto-exposure settles.
+        # A naive `ret == True` check will happily accept those. Wait until
+        # a frame actually has pixel variance, or give up after ~2s.
+        warm_frame = None
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                # Cheap "is this actually an image?" check — a 32-sample
+                # stride is plenty to distinguish real pixels from zeros.
+                sample = frame[::32, ::32]
+                if sample.mean() > 8.0 and sample.std() > 3.0:
+                    warm_frame = frame
+                    break
+            time.sleep(0.03)
+        if warm_frame is None:
+            try: self.cap.release()
+            except Exception: pass
+            self.cap = None
+            return False, (
+                "camera opened but only returned black frames after 2s. "
+                "Try pointing it at a brighter scene, or check that another "
+                "app isn't already holding the camera."
+            )
+        with self.lock:
+            self.is_recording = True
+            self.frames = [warm_frame]  # seed with the first real frame
+        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.thread.start()
+        return True, "ok"
+
+    def _capture_loop(self) -> None:
+        while True:
+            with self.lock:
+                if not self.is_recording or self.cap is None:
+                    break
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                # Skip the occasional black frame AVFoundation drops in —
+                # same pixel-variance check as warm-up.
+                sample = frame[::32, ::32]
+                if sample.mean() > 8.0 and sample.std() > 3.0:
+                    with self.lock:
+                        self.frames.append(frame)
+            time.sleep(self.capture_interval)
+
+    def stop_recording(self, n_frames: int = 3) -> list[str]:
+        """Stop capture and return up to n_frames evenly-spaced frames as
+        `data:image/jpeg;base64,...` URLs."""
+        with self.lock:
+            self.is_recording = False
+            frames = self.frames
+            self.frames = []
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+            self.thread = None
+        if self.cap is not None:
+            try: self.cap.release()
+            except Exception: pass
+            self.cap = None
+        if not frames:
+            return []
+        if len(frames) <= n_frames:
+            sampled = frames
+        else:
+            step = len(frames) / n_frames
+            sampled = [frames[int(i * step)] for i in range(n_frames)]
+        out: list[str] = []
+        for frame in sampled:
+            h, w = frame.shape[:2]
+            if w > self.target_width:
+                scale = self.target_width / w
+                frame = cv2.resize(frame, (self.target_width, int(h * scale)))
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if not ok:
+                continue
+            b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+            out.append(f"data:image/jpeg;base64,{b64}")
+        return out
+
+
 # Appended to the system prompt ONLY when voice is active.
 PARALINGUISTIC_ADDENDUM = """
 
@@ -286,19 +448,35 @@ class SamanthaTUI(App):
         Binding("ctrl+c", "quit", "quit", show=False),
         Binding("ctrl+n", "new_session", "new session", show=True),
         Binding("ctrl+m", "toggle_mute", "mute", show=True),
+        Binding("ctrl+y", "copy_reply", "copy last reply", show=True),
+        Binding("up", "history_prev", "prev input", show=False),
+        Binding("down", "history_next", "next input", show=False),
     ]
 
-    def __init__(self, voice: VoiceBackend | None = None) -> None:
+    def __init__(
+        self,
+        voice: VoiceBackend | None = None,
+        video: VideoBackend | None = None,
+    ) -> None:
         super().__init__()
         self.title = APP_NAME
         self.voice = voice
+        self.video = video
         self.session: dict[str, Any] | None = None
-        self.messages: list[dict[str, str]] = []
+        self.messages: list[dict[str, Any]] = []
         self.transcript: list[str] = []
         self._pynput_listener = None
         self._chat_container: ScrollableContainer | None = None
         self._transcript_list: ListView | None = None
         self._current_ai: ChatMessage | None = None
+        self._input_history: list[str] = []
+        self._history_idx: int = 0
+        self._last_reply: str = ""
+        # Which PTT modifier is currently held: "audio" (Option), "vision"
+        # (Command), or None. Set on press, cleared on release. Ensures
+        # that releasing a different modifier doesn't stop a recording
+        # started by the first one.
+        self._ptt_mode: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Container(
@@ -321,11 +499,19 @@ class SamanthaTUI(App):
                             id="user-input",
                         )
                     bar = StatusBar(id="status-bar")
-                    bar.hotkey_hint = (
-                        "OPTION talk   Type send   ×  delete transcript   Esc quit (auto-save)"
-                        if HAS_PYNPUT else
-                        "Type send   ×  delete transcript   Esc quit (auto-save)"
-                    )
+                    if HAS_PYNPUT:
+                        bar.hotkey_hint = (
+                            "⌥ talk   ⌘ see+talk   Type send   ↑↓ history   "
+                            "Ctrl-Y copy reply   Esc quit (auto-save)"
+                        ) if HAS_CV2 else (
+                            "⌥ talk   Type send   ↑↓ history   "
+                            "Ctrl-Y copy reply   Esc quit (auto-save)"
+                        )
+                    else:
+                        bar.hotkey_hint = (
+                            "Type send   ↑↓ history   Ctrl-Y copy reply   "
+                            "Esc quit (auto-save)"
+                        )
                     yield bar
 
     def on_mount(self) -> None:
@@ -354,6 +540,16 @@ class SamanthaTUI(App):
             )
         if not HAS_PYNPUT:
             self._system_message("pynput not installed — push-to-talk disabled.")
+        if HAS_CV2 and self.video is not None:
+            vm = (CONFIG.get("models") or {}).get("vision") or {}
+            self._system_message(
+                f"vision: hold ⌘ to see + speak · {vm.get('provider', '?')} / {vm.get('model', '?')}"
+            )
+        elif not HAS_CV2:
+            self._system_message(
+                "opencv-python not installed — hold-⌘ camera mode disabled. "
+                "install: pip install opencv-python"
+            )
 
     # ----- sidebar / transcripts --------------------------------------
 
@@ -439,10 +635,45 @@ class SamanthaTUI(App):
         event.input.value = ""
         if not text:
             return
+        if not self._input_history or self._input_history[-1] != text:
+            self._input_history.append(text)
+        self._history_idx = len(self._input_history)
         if text.lower() in ("quit", "exit", "bye", ":q"):
             self.action_quit()
             return
         self._send(text)
+
+    # ----- history + clipboard ----------------------------------------
+
+    def action_history_prev(self) -> None:
+        inp = self.query_one("#user-input", Input)
+        if self.focused is not inp or not self._input_history:
+            return
+        if self._history_idx > 0:
+            self._history_idx -= 1
+        inp.value = self._input_history[self._history_idx]
+        inp.cursor_position = len(inp.value)
+
+    def action_history_next(self) -> None:
+        inp = self.query_one("#user-input", Input)
+        if self.focused is not inp or not self._input_history:
+            return
+        if self._history_idx < len(self._input_history) - 1:
+            self._history_idx += 1
+            inp.value = self._input_history[self._history_idx]
+        else:
+            self._history_idx = len(self._input_history)
+            inp.value = ""
+        inp.cursor_position = len(inp.value)
+
+    def action_copy_reply(self) -> None:
+        if not self._last_reply:
+            self._system_message("nothing to copy yet.")
+            return
+        if copy_to_clipboard(self._last_reply):
+            self._system_message(f"copied last reply ({len(self._last_reply)} chars).")
+        else:
+            self._system_message("clipboard unavailable on this platform.")
 
     # ----- input: voice (PTT) -----------------------------------------
 
@@ -450,15 +681,55 @@ class SamanthaTUI(App):
         if not HAS_PYNPUT:
             return
 
+        alt_keys = (keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r)
+        cmd_keys = (keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r)
+
         def on_press(key):
-            if key in (keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r):
+            if self._ptt_mode is not None:
+                return  # a recording is already in progress; ignore other mods
+            if key in alt_keys:
                 if self.voice and self.voice.start_recording():
+                    self._ptt_mode = "audio"
                     self.call_from_thread(self._on_listen_start)
+            elif key in cmd_keys:
+                # Always surface a message on Cmd press so the user can tell
+                # whether pynput even saw the key (vs. a silent failure).
+                if self.video is None:
+                    self.call_from_thread(
+                        self._system_message,
+                        "⌘ pressed — but vision mode is disabled (cv2 missing or camera probe failed at startup)."
+                    )
+                    return
+                if not self.voice:
+                    self.call_from_thread(
+                        self._system_message,
+                        "⌘ pressed — but voice backend is unavailable."
+                    )
+                    return
+                if not self.voice.start_recording():
+                    self.call_from_thread(
+                        self._system_message, "⌘ pressed — audio recorder refused to start."
+                    )
+                    return
+                ok, reason = self.video.start_recording()
+                if ok:
+                    self._ptt_mode = "vision"
+                    self.call_from_thread(self._on_see_start)
+                else:
+                    # Camera failed; fall back to audio-only for this press.
+                    self._ptt_mode = "audio"
+                    self.call_from_thread(self._on_listen_start)
+                    self.call_from_thread(
+                        self._system_message, f"⌘ pressed — camera failed · {reason}"
+                    )
 
         def on_release(key):
-            if key in (keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r):
-                if self.voice:
-                    self.call_from_thread(self._on_listen_stop)
+            if self._ptt_mode == "audio" and key in alt_keys:
+                self._ptt_mode = None
+                self.call_from_thread(self._on_listen_stop)
+            elif self._ptt_mode == "vision" and key in cmd_keys:
+                self._ptt_mode = None
+                self.call_from_thread(self._on_see_stop)
 
         self._pynput_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         self._pynput_listener.start()
@@ -473,6 +744,17 @@ class SamanthaTUI(App):
         bar.listening = False
         bar.text = "transcribing..."
         self._transcribe_and_send()
+
+    def _on_see_start(self) -> None:
+        bar = self.query_one("#status-bar", StatusBar)
+        bar.listening = True
+        bar.text = "🎤📷 recording audio + video..."
+
+    def _on_see_stop(self) -> None:
+        bar = self.query_one("#status-bar", StatusBar)
+        bar.listening = False
+        bar.text = "transcribing + encoding frames..."
+        self._transcribe_and_send_vision()
 
     @work(thread=True)
     def _transcribe_and_send(self) -> None:
@@ -492,15 +774,36 @@ class SamanthaTUI(App):
             return
         self.call_from_thread(self._send, text)
 
+    @work(thread=True)
+    def _transcribe_and_send_vision(self) -> None:
+        if not self.voice or not self.video:
+            return
+        text = self.voice.stop_recording() or ""
+        frames = self.video.stop_recording(n_frames=3)
+        if not frames:
+            self.call_from_thread(self._system_message, "(camera captured no frames)")
+            self.call_from_thread(self._set_status, "")
+            if not text:
+                return
+            self.call_from_thread(self._send, text)
+            return
+        self.call_from_thread(self._set_status, "")
+        # Empty transcript + frames → treat as an implicit "describe this".
+        prompt = text.strip() or "Describe what you see."
+        self.call_from_thread(self._send, prompt, frames)
+
     # ----- chat pipeline ----------------------------------------------
 
-    def _send(self, user_text: str) -> None:
-        self._user_message(user_text)
+    def _send(self, user_text: str, frames: list[str] | None = None) -> None:
+        label = user_text
+        if frames:
+            label = f"{user_text}  📷 [{len(frames)} frame{'s' if len(frames) != 1 else ''}]"
+        self._user_message(label)
         self._start_ai_message()
-        self._run_chat(user_text)
+        self._run_chat(user_text, frames)
 
     @work(thread=True)
-    def _run_chat(self, user_text: str) -> None:
+    def _run_chat(self, user_text: str, frames: list[str] | None = None) -> None:
         if self.session is None:
             try:
                 self.session = session_mgr.start(
@@ -520,8 +823,20 @@ class SamanthaTUI(App):
                 self.call_from_thread(self._finish_ai_message, f"(start failed: {exc})")
                 return
 
-        self.messages.append({"role": "user", "content": user_text})
-        self.transcript.append(f"## USER\n{user_text}")
+        if frames:
+            content_parts: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
+            for url in frames:
+                content_parts.append({"type": "image_url", "image_url": {"url": url}})
+            self.messages.append({"role": "user", "content": content_parts})
+            self.transcript.append(
+                f"## USER\n{user_text}  [attached {len(frames)} camera frame(s)]"
+            )
+            # Use the vision role if the user configured one; fall back to model1.
+            role = "vision" if "vision" in (CONFIG.get("models") or {}) else "model1"
+        else:
+            self.messages.append({"role": "user", "content": user_text})
+            self.transcript.append(f"## USER\n{user_text}")
+            role = "model1"
         window = CONFIG["session"]["history_window"]
 
         full_reply = ""
@@ -529,7 +844,7 @@ class SamanthaTUI(App):
         spoken_so_far = ""
         try:
             for chunk in reflection.chat_stream(
-                role="model1",
+                role=role,
                 system=self.session["system_prompt"],
                 messages=self.messages[-window:],
                 config=CONFIG,
@@ -573,6 +888,16 @@ class SamanthaTUI(App):
                 "reasoning. Try again or ask a smaller question.)",
             )
 
+        # Images are costly to re-send every turn. Now that the model has
+        # answered, collapse this turn's user message to text-only in history
+        # (the model's reply already encodes what it saw).
+        if frames and self.messages:
+            last_user_idx = len(self.messages) - 1
+            if isinstance(self.messages[last_user_idx].get("content"), list):
+                self.messages[last_user_idx]["content"] = (
+                    f"{user_text}  [had attached {len(frames)} camera frame(s)]"
+                )
+
         self.messages.append({"role": "assistant", "content": reply})
         self.transcript.append(f"## ASSISTANT\n{reply}")
         self.call_from_thread(self._finish_ai_message, reply)
@@ -605,6 +930,7 @@ class SamanthaTUI(App):
         if self._current_ai is not None:
             self._current_ai.update_content(content)
             self._current_ai = None
+        self._last_reply = content
         self._chat_container.scroll_end(animate=False)
 
     def _set_status(self, text: str) -> None:
@@ -671,7 +997,26 @@ def main() -> None:
     parser.add_argument("--tts-model", default="mlx-community/chatterbox-turbo-fp16")
     parser.add_argument("--ref-audio", default=REF_AUDIO_DEFAULT)
     parser.add_argument("--no-voice", action="store_true")
+    parser.add_argument(
+        "--camera-index", type=int, default=None,
+        help="Which camera index to use for vision mode. If unset, probes "
+             "all available cameras and picks the MacBook's built-in over "
+             "Continuity-Camera-connected iPhones.",
+    )
+    parser.add_argument(
+        "--list-cameras", action="store_true",
+        help="Probe available cameras, print their indices + resolutions, and exit.",
+    )
     args = parser.parse_args()
+
+    if args.list_cameras:
+        cams = probe_cameras()
+        if not cams:
+            print("(no cameras detected — is opencv-python installed and the terminal granted camera access?)")
+        else:
+            for c in cams:
+                print(f"  index {c['index']}: {c['width']}x{c['height']}")
+        return
 
     voice: VoiceBackend | None = None
     if HAS_VOICE and not args.no_voice:
@@ -688,7 +1033,33 @@ def main() -> None:
         print(f"\n\033[93m[{APP_NAME}] voice stack not installed — text-only mode.\033[0m")
         print("\033[2m  install: pip install -r requirements-voice.txt\033[0m\n")
 
-    SamanthaTUI(voice=voice).run()
+    video: VideoBackend | None = None
+    if HAS_CV2:
+        idx = args.camera_index
+        cams = probe_cameras()
+        if idx is None:
+            if not cams:
+                idx = 0  # will fail at press-time with a clear message
+            elif len(cams) == 1:
+                idx = cams[0]["index"]
+            else:
+                # Multiple cameras → prefer the MacBook's built-in. Continuity
+                # Camera (iPhone) shows up at the LOWER index and reports much
+                # higher resolutions (e.g. 1920×1440, 4032×3024). The built-in
+                # FaceTime HD is 1280×720 or 1920×1080 — pick the HIGHER-index
+                # one whose resolution is ≤ 1920×1080, which is almost always
+                # the MacBook.
+                candidates = [c for c in cams if c["width"] <= 1920 and c["height"] <= 1080]
+                picked = max(candidates, key=lambda c: c["index"]) if candidates else cams[-1]
+                idx = picked["index"]
+                print(
+                    f"\033[2m[{APP_NAME}] cameras: " +
+                    ", ".join(f"idx {c['index']} ({c['width']}x{c['height']})" for c in cams) +
+                    f"  →  picking index {idx}. Override with --camera-index N.\033[0m"
+                )
+        video = VideoBackend(camera_index=idx)
+
+    SamanthaTUI(voice=voice, video=video).run()
 
 
 if __name__ == "__main__":

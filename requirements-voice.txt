@@ -16,3 +16,7 @@ textual>=0.47.0
 
 # Push-to-talk keyboard hook
 pynput>=1.7.6
+
+# Camera capture for "hold ⌘ to see" multimodal mode (optional — the TUI
+# falls back to audio-only if cv2 is missing). Uses AVFoundation on macOS.
+opencv-python>=4.9.0

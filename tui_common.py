@@ -337,6 +337,36 @@ def split_sentence(buffer: str) -> tuple[str, str]:
     return buffer[:end].strip(), buffer[end:]
 
 
+def copy_to_clipboard(text: str) -> bool:
+    """Pipe text to the system clipboard. Returns True on success.
+    Used by the TUIs because Textual captures mouse events, which breaks
+    normal terminal text-select → Cmd-C copy."""
+    import shutil
+    import subprocess
+    import sys
+
+    if sys.platform == "darwin":
+        cmd = ["pbcopy"]
+    elif sys.platform.startswith("linux"):
+        if shutil.which("wl-copy"):
+            cmd = ["wl-copy"]
+        elif shutil.which("xclip"):
+            cmd = ["xclip", "-selection", "clipboard"]
+        elif shutil.which("xsel"):
+            cmd = ["xsel", "--clipboard", "--input"]
+        else:
+            return False
+    elif sys.platform.startswith("win"):
+        cmd = ["clip"]
+    else:
+        return False
+    try:
+        subprocess.run(cmd, input=text.encode(), check=True)
+        return True
+    except Exception:
+        return False
+
+
 def log_error(vault: Path, source: str, exc: Exception) -> Path:
     """Append a timestamped error to vault/_meta/errors.log — a persistent
     record the user can `cat` outside the TUI (since Textual captures

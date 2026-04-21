@@ -25,13 +25,13 @@ from textual import work
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from core import decay, monitor, reflection, retrieval  # noqa: E402
+from core import decay, dedup, monitor, reflection, retrieval  # noqa: E402
 from scheduler import session as session_mgr  # noqa: E402
 from utils import env, frontmatter, indexer  # noqa: E402
 from tui_common import (  # noqa: E402
     BASE_CSS, ChatMessage, StatusBar, TranscriptItem,
     read_identity, transcript_entries, parse_transcript, strip_meme_flags,
-    log_error,
+    log_error, copy_to_clipboard,
 )
 
 env.load_dotenv(ROOT / ".env")
@@ -90,6 +90,9 @@ class MemeTUI(App):
         Binding("escape", "quit", "quit", show=True),
         Binding("ctrl+c", "quit", "quit", show=False),
         Binding("ctrl+n", "new_session", "new session", show=True),
+        Binding("ctrl+y", "copy_reply", "copy last reply", show=True),
+        Binding("up", "history_prev", "prev input", show=False),
+        Binding("down", "history_next", "next input", show=False),
     ]
 
     def __init__(self) -> None:
@@ -101,6 +104,9 @@ class MemeTUI(App):
         self._chat_container: ScrollableContainer | None = None
         self._transcript_list: ListView | None = None
         self._current_ai: ChatMessage | None = None
+        self._input_history: list[str] = []
+        self._history_idx: int = 0
+        self._last_reply: str = ""
 
     def compose(self) -> ComposeResult:
         yield Container(
@@ -122,7 +128,10 @@ class MemeTUI(App):
                             id="user-input",
                         )
                     bar = StatusBar(id="status-bar")
-                    bar.hotkey_hint = "Type send   /help   Ctrl-N new   Esc quit (auto-save)"
+                    bar.hotkey_hint = (
+                        "Type send   ↑↓ history   Ctrl-Y copy reply   "
+                        "Ctrl-N new   /help   Esc quit (auto-save)"
+                    )
                     yield bar
 
     def on_mount(self) -> None:
@@ -213,6 +222,10 @@ class MemeTUI(App):
         event.input.value = ""
         if not text:
             return
+        if not self._input_history or self._input_history[-1] != text:
+            self._input_history.append(text)
+        self._history_idx = len(self._input_history)
+
         low = text.lower()
 
         if low in EXIT_PHRASES:
@@ -227,6 +240,38 @@ class MemeTUI(App):
             return
 
         self._send(text)
+
+    # ----- history + clipboard ----------------------------------------
+
+    def action_history_prev(self) -> None:
+        inp = self.query_one("#user-input", Input)
+        if self.focused is not inp or not self._input_history:
+            return
+        if self._history_idx > 0:
+            self._history_idx -= 1
+        inp.value = self._input_history[self._history_idx]
+        inp.cursor_position = len(inp.value)
+
+    def action_history_next(self) -> None:
+        inp = self.query_one("#user-input", Input)
+        if self.focused is not inp or not self._input_history:
+            return
+        if self._history_idx < len(self._input_history) - 1:
+            self._history_idx += 1
+            inp.value = self._input_history[self._history_idx]
+        else:
+            self._history_idx = len(self._input_history)
+            inp.value = ""
+        inp.cursor_position = len(inp.value)
+
+    def action_copy_reply(self) -> None:
+        if not self._last_reply:
+            self._system_message("nothing to copy yet.")
+            return
+        if copy_to_clipboard(self._last_reply):
+            self._system_message(f"copied last reply ({len(self._last_reply)} chars).")
+        else:
+            self._system_message("clipboard unavailable on this platform.")
 
     # ----- command dispatch -------------------------------------------
 
@@ -313,12 +358,14 @@ class MemeTUI(App):
     def cmd_monitor(self, _: str) -> None:
         metrics = monitor.collect(VAULT)
         triggers = monitor.check_thresholds(metrics, CONFIG)
+        dups = dedup.find_duplicate_candidates(VAULT)
         lines = [
             f"nodes: {metrics['total_nodes']}",
             f"archived: {metrics['archived']} ({metrics['archived_ratio']:.1%})",
             f"orphans: {metrics['orphans']} ({metrics['orphan_ratio']:.1%})",
             f"tags: {metrics['tag_vocabulary']}",
             f"avg decay weight: {metrics['avg_decay_weight']:.3f}",
+            f"duplicate candidates: {len(dups)}",
         ]
         if metrics["top_hubs"]:
             lines.append("top hubs:")
@@ -346,6 +393,16 @@ class MemeTUI(App):
             triggers = monitor.check_thresholds(metrics, CONFIG)
             if orphans:
                 triggers.append(f"orphan_review: {', '.join(orphans[:10])}")
+            # Surface near-duplicate node pairs so the auditor can merge them.
+            # This is how we keep the graph from rotting into parallel
+            # synonymy nodes (the failure mode decay does NOT catch).
+            dup_candidates = dedup.find_duplicate_candidates(VAULT)
+            if dup_candidates:
+                for c in dup_candidates[:10]:
+                    triggers.append(
+                        f"duplicate_merge_candidate: [{c['type']}] "
+                        f"{c['a']} ↔ {c['b']} ({c['reason']})"
+                    )
             sample_query = " ".join(n for n, _ in metrics["top_hubs"][:5])
             files = retrieval.retrieve(VAULT, sample_query, [], CONFIG)
             output, call_log = reflection.deep_with_tools(
@@ -526,6 +583,7 @@ class MemeTUI(App):
         if self._current_ai is not None:
             self._current_ai.update_content(content)
             self._current_ai = None
+        self._last_reply = content
         self._chat_container.scroll_end(animate=False)
 
 
