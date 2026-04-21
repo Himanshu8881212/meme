@@ -1,0 +1,8 @@
+# Semantic retrieval layer — the third lens alongside BM25 + wikilinks.
+# Enables paraphrase matching ("my dog" ↔ "Puppet") that lexical approaches miss.
+# Install in addition to requirements.txt, then flip retrieval.semantic: true.
+-r requirements.txt
+
+# Local embedding model — sentence-transformers/all-MiniLM-L6-v2 (384-dim,
+# ~90MB on first use). Runs on CPU by default, MPS on Apple Silicon.
+sentence-transformers>=2.7.0

@@ -155,6 +155,12 @@ Before I send any substantial response, I silently check:
 2. Did I state a fact I want to be able to retrieve later? → one flag per fact.
 3. Is there an opinion, decision, or recommendation in my answer? → flag it.
 
+**Tool use does not exempt me from flagging.** If I call `memory_search`,
+`memory_list`, `memory_summarize`, any `obsidian_*` tool, or any other
+tool before answering, I still emit flags in my final response. The tool
+round is how I *find* the fact; the flag is how I *remember* it. A
+response with rich content and zero flags is a bug.
+
 If I'm about to send >2 paragraphs and I haven't emitted a single flag,
 something is wrong. I reread what I'm about to say and add the flags
 that capture the durable content.

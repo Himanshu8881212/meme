@@ -14,6 +14,28 @@ SESSION_LOG = "session_log.md"
 TRANSCRIPTS_DIR_NAME = "_transcripts"
 SLUG_RE = re.compile(r"[^a-z0-9]+")
 
+# External-vault tool outputs can be arbitrarily large (a whole read_note
+# dump). Truncate them when they make it into the archived transcript body.
+_OBSIDIAN_TOOL_OUTPUT_LIMIT = 500
+_OBSIDIAN_TOOL_BLOCK = re.compile(
+    r"(## TOOL obsidian_\w+\n)(.+?)(?=\n##\s|\Z)",
+    re.DOTALL,
+)
+
+
+def truncate_obsidian_tool_outputs(transcript: str) -> str:
+    """Cap any `## TOOL obsidian_*` block in a transcript to 500 chars.
+
+    No-op unless someone has explicitly inlined tool output; current front
+    ends don't, but this keeps the separation guarantee honest.
+    """
+    def _sub(m: re.Match[str]) -> str:
+        head, body = m.group(1), m.group(2)
+        if len(body) <= _OBSIDIAN_TOOL_OUTPUT_LIMIT:
+            return m.group(0)
+        return head + body[:_OBSIDIAN_TOOL_OUTPUT_LIMIT] + "… [truncated]\n"
+    return _OBSIDIAN_TOOL_BLOCK.sub(_sub, transcript)
+
 
 def _slugify(text: str) -> str:
     slug = SLUG_RE.sub("-", text.lower()).strip("-")
@@ -41,7 +63,8 @@ def archive_transcript(vault: Path, transcript: str, task: str, tags: list[str])
         "tags": list(tags or []),
         "immutable": True,
     }
-    body = f"# Session transcript — {ts.strftime('%Y-%m-%d %H:%M:%S')}\n\nTask: {task}\n\n{transcript}\n"
+    clean = truncate_obsidian_tool_outputs(transcript)
+    body = f"# Session transcript — {ts.strftime('%Y-%m-%d %H:%M:%S')}\n\nTask: {task}\n\n{clean}\n"
     frontmatter.write(path, fm, body)
     return name
 
@@ -103,6 +126,54 @@ def start(task: str, tags: list[str], config: dict[str, Any], project_root: Path
         .replace("{{IDENTITY}}", identity_block)
         .replace("{{RETRIEVED_CONTEXT}}", context_block)
     )
+
+    from core import obsidian as _ob
+    ext_vault = _ob.resolve_vault_path(config)
+    if ext_vault is not None:
+        # Snapshot the current folder layout so the chat model knows where
+        # things live without having to list the whole vault every turn.
+        folders: list[str] = []
+        try:
+            for p in sorted(ext_vault.iterdir()):
+                if p.is_dir() and not p.name.startswith(".") and p.name != "_trash":
+                    folders.append(p.name)
+        except Exception:
+            folders = []
+        folder_line = ", ".join(folders) if folders else "(empty — no folders yet)"
+        composed_system += (
+            "\n\n## I can read, write, and manage your notebook\n\n"
+            f"Your Obsidian vault lives at `{ext_vault}`.\n"
+            f"Current top-level folders: {folder_line}\n\n"
+            "**READ when the question is about your stuff** — use "
+            "`obsidian_search`, `obsidian_list`, `obsidian_read`. Triggers: "
+            "'what's on my X list', 'what did I write about Y', 'do I have "
+            "a note on Z', 'show me my reminders', 'find my notes on ...'.\n\n"
+            "**WRITE when the user asks you to capture anything** — use "
+            "`obsidian_create` (new), `obsidian_update` (edit existing — "
+            "append/prepend/replace), `obsidian_link`. Always "
+            "`obsidian_list` or `obsidian_search` FIRST so you don't "
+            "duplicate a note that already exists.\n\n"
+            "**MANAGE when the user asks you to reorganize** — use "
+            "`obsidian_rename` (updates every incoming wikilink) and "
+            "`obsidian_delete` (soft-delete to `_trash/`, reversible). "
+            "Always confirm the exact target with a search/list first.\n\n"
+            "### Searching well (this is where I usually fail)\n\n"
+            "The user's question is NOT the query. Extract ONE or TWO key "
+            "concept words and search for those. Examples:\n"
+            "- 'what's on my grocery list?' → `obsidian_search(\"grocery\")`, "
+            "not the whole question.\n"
+            "- 'did I write anything about React Router?' → "
+            "`obsidian_search(\"React Router\")`.\n"
+            "- 'what's in my todo list?' → `obsidian_list(folder=\"Todo\")` "
+            "is more complete than any phrase search.\n\n"
+            "If the first search returns nothing, try a SHORTER query (just "
+            "the root noun) or `obsidian_list` the likely folder. Only fall "
+            "back to general-knowledge answers after I've actually looked.\n\n"
+            "Notes in this vault are YOURS — my own memory only records "
+            "that we had a conversation, not the notes' content. When I'm "
+            "answering from a note I found, say so explicitly so the user "
+            "can tell sourced-from-their-notes apart from my own guesses.\n"
+        )
 
     return {
         "task": task,

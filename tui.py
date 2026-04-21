@@ -25,7 +25,7 @@ from textual import work
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from core import decay, dedup, monitor, reflection, retrieval  # noqa: E402
+from core import decay, dedup, monitor, obsidian, outreach, proactive, reflection, retrieval  # noqa: E402
 from scheduler import session as session_mgr  # noqa: E402
 from utils import env, frontmatter, indexer  # noqa: E402
 from tui_common import (  # noqa: E402
@@ -54,7 +54,9 @@ BARE_COMMANDS = {
     "meta": "/meta", "decay": "/decay", "monitor": "/monitor",
     "help": "/help", "context": "/context",
     "identity": "/identity", "whoami": "/identity",
-    "index": "/index",
+    "index": "/index", "obsidian": "/obsidian",
+    "outreach": "/outreach", "whats_up": "/whats_up",
+    "pause": "/pause", "mute": "/mute", "unmute": "/unmute",
 }
 
 HELP = """How to use
@@ -75,6 +77,20 @@ Maintenance
   /decay            update decay weights across the vault
   /monitor          vault health metrics + triggers
   /index            vault stats + sample node names
+
+External notebook
+  /obsidian         path, note count, last audit entry
+  /obsidian recent  last 10 audit entries
+  /obsidian diff    git diff HEAD~5 on the external vault
+
+Proactive
+  /whats_up         top 3 candidates w/ scores — read-only, no log
+  /outreach         last 10 log entries
+  /outreach status  enabled, paused-until, today's count
+  /pause 24h        mute surfacing for 24h (also 30m, 2d, until ...)
+  /pause off        clear the pause
+  /mute <node>      set proactive: false on a node
+  /unmute <node>    set proactive: true on a node
 
 Leave
   quit / exit / bye / Esc   saves the session on the way out
@@ -107,6 +123,14 @@ class MemeTUI(App):
         self._input_history: list[str] = []
         self._history_idx: int = 0
         self._last_reply: str = ""
+        # True while a chat worker is running — blocks new submissions so
+        # self.messages / self.transcript don't race.
+        self._chat_busy: bool = False
+        # Proactive: if the last startup surfaced an outreach, we tag the
+        # next session start so retrieval + reflection know the context.
+        self._proactive_prefix: str | None = None
+        self._proactive_node_path: str | None = None
+        self._pending_proactive: dict[str, Any] | None = None
 
     def compose(self) -> ComposeResult:
         yield Container(
@@ -152,6 +176,17 @@ class MemeTUI(App):
         self._system_message(
             f"chat model: {m1.get('provider', '?')} / {m1.get('model', '?')}"
         )
+
+        ext = obsidian.resolve_vault_path(CONFIG)
+        if ext is not None:
+            head = obsidian.git_head(ext) or "no git"
+            self._system_message(
+                f"external vault: {ext}  (notes: {obsidian.note_count(ext)}, git: {head})"
+            )
+        else:
+            self._system_message("external vault: (disabled — set external_vault.path in config.yaml)")
+
+        self._maybe_surface_proactive()
 
     # ----- sidebar ----------------------------------------------------
 
@@ -239,6 +274,9 @@ class MemeTUI(App):
             self._dispatch(text)
             return
 
+        if self._chat_busy:
+            self._system_message("(still thinking — hold on a moment.)")
+            return
         self._send(text)
 
     # ----- history + clipboard ----------------------------------------
@@ -377,6 +415,172 @@ class MemeTUI(App):
                 lines.append(f"  • {t}")
         self._system_message("\n".join(lines))
 
+    def cmd_obsidian(self, arg: str) -> None:
+        ext = obsidian.resolve_vault_path(CONFIG)
+        if ext is None:
+            self._system_message("external vault is disabled (external_vault.path: null).")
+            return
+        sub = (arg or "").strip().lower()
+        if sub == "recent":
+            entries = obsidian.read_audit_tail(ext, n=10)
+            if not entries:
+                self._system_message("(no audit entries yet)")
+                return
+            lines = ["last audit entries:"]
+            for e in entries:
+                lines.append(f"  {e.get('ts','?')}  {e.get('tool','?')}  {e.get('result','')[:120]}")
+            self._system_message("\n".join(lines))
+            return
+        if sub == "diff":
+            import subprocess
+            try:
+                out = subprocess.run(
+                    ["git", "diff", "HEAD~5"],
+                    cwd=str(ext), capture_output=True, text=True, timeout=10,
+                )
+                text = (out.stdout or out.stderr or "(no diff)").strip()
+            except Exception as exc:
+                text = f"(git diff failed: {exc})"
+            self._system_message(text[:4000] or "(no diff)")
+            return
+        # default summary
+        tail = obsidian.read_audit_tail(ext, n=1)
+        last = "-"
+        if tail:
+            e = tail[0]
+            last = f"{e.get('ts','?')} {e.get('tool','?')} — {e.get('result','')[:80]}"
+        head = obsidian.git_head(ext) or "(no git)"
+        self._system_message(
+            f"external vault: {ext}\n"
+            f"notes: {obsidian.note_count(ext)}\n"
+            f"head: {head}\n"
+            f"last audit: {last}"
+        )
+
+    # ----- proactive outreach ----------------------------------------
+
+    def _maybe_surface_proactive(self) -> None:
+        pcfg = (CONFIG.get("proactive") or {})
+        if not pcfg.get("enabled"):
+            return
+        pause = outreach.active_pause(VAULT)
+        if pause is not None:
+            return
+        try:
+            ctx = outreach.build_context(VAULT, CONFIG)
+            cs = proactive.candidates(VAULT, CONFIG)
+            pick = proactive.should_reach_out(cs, ctx, CONFIG)
+        except Exception as exc:
+            self._system_message(f"(proactive: error building candidates: {exc})")
+            return
+        if pick is None:
+            return
+        self._pending_proactive = pick
+        self._system_message(f"📬 I've been thinking about {pick['node_name']}...")
+        self._run_proactive_draft(pick)
+
+    @work(thread=True)
+    def _run_proactive_draft(self, pick: dict[str, Any]) -> None:
+        try:
+            msg = outreach.draft_message(pick, VAULT, CONFIG)
+        except Exception as exc:
+            self.call_from_thread(self._system_message, f"(outreach draft failed: {exc})")
+            return
+        try:
+            outreach.log_outreach(VAULT, pick, msg, delivered=True)
+        except Exception:
+            pass
+        self.call_from_thread(self._ai_message, msg)
+        # Prime the next session so reflection knows the opener was proactive.
+        self._proactive_prefix = pick["node_name"]
+        self._proactive_node_path = pick.get("node_path")
+
+    def cmd_whats_up(self, _: str) -> None:
+        try:
+            cs = proactive.candidates(VAULT, CONFIG)
+        except Exception as exc:
+            self._system_message(f"whats_up error: {exc}")
+            return
+        if not cs:
+            self._system_message("(nothing on my mind — no candidates)")
+            return
+        lines = ["top candidates (read-only):"]
+        for c in cs[:3]:
+            reasons = "; ".join(c.get("reasons") or []) or "-"
+            lines.append(
+                f"  {c['score']:.2f}  [{c.get('node_type','?')}] {c['node_name']}"
+                f"  — {reasons}"
+            )
+        self._system_message("\n".join(lines))
+
+    def cmd_outreach(self, arg: str) -> None:
+        sub = (arg or "").strip().lower()
+        if sub == "status":
+            pcfg = (CONFIG.get("proactive") or {})
+            enabled = bool(pcfg.get("enabled"))
+            pause = outreach.active_pause(VAULT)
+            ctx = outreach.build_context(VAULT, CONFIG)
+            lines = [
+                f"enabled: {enabled}",
+                f"paused until: {pause.isoformat(timespec='seconds') if pause else '-'}",
+                f"delivered today: {ctx['outreaches_today']}  (cap={pcfg.get('daily_cap', 3)})",
+            ]
+            hs = ctx.get("hours_since_last_outreach")
+            if hs is not None:
+                lines.append(f"hours since last outreach: {hs:.1f}")
+            self._system_message("\n".join(lines))
+            return
+        entries = outreach.tail_log(VAULT, n=10)
+        if not entries:
+            self._system_message("(outreach log is empty)")
+            return
+        lines = ["last outreaches:"]
+        for e in entries:
+            lines.append(
+                f"  {e['ts'].isoformat(timespec='seconds')}  "
+                f"score={e['score']:.2f}  delivered={e['delivered']}  {e['node']}"
+            )
+        self._system_message("\n".join(lines))
+
+    def cmd_pause(self, arg: str) -> None:
+        arg = (arg or "").strip()
+        if arg.lower() == "off":
+            if outreach.clear_pause(VAULT):
+                self._system_message("proactive: unpaused.")
+            else:
+                self._system_message("no pause was active.")
+            return
+        until = outreach.parse_pause_arg(arg)
+        if until is None:
+            self._system_message(
+                "usage: /pause 24h   |   /pause until 2026-05-01   |   /pause off"
+            )
+            return
+        outreach.set_pause(VAULT, until)
+        self._system_message(
+            f"proactive: paused until {until.isoformat(timespec='seconds')}."
+        )
+
+    def cmd_mute(self, arg: str) -> None:
+        name = (arg or "").strip()
+        if not name:
+            self._system_message("usage: /mute <node name>")
+            return
+        if outreach.set_node_proactive(VAULT, name, False):
+            self._system_message(f"muted: {name}")
+        else:
+            self._system_message(f"no node matching '{name}'")
+
+    def cmd_unmute(self, arg: str) -> None:
+        name = (arg or "").strip()
+        if not name:
+            self._system_message("usage: /unmute <node name>")
+            return
+        if outreach.set_node_proactive(VAULT, name, True):
+            self._system_message(f"unmuted: {name}")
+        else:
+            self._system_message(f"no node matching '{name}'")
+
     def cmd_meta(self, _: str) -> None:
         """Deep reflection — runs in a worker so the UI stays responsive."""
         self._system_message("deep reflection running (this takes ~30-60s)...")
@@ -431,6 +635,7 @@ class MemeTUI(App):
     # ----- chat -------------------------------------------------------
 
     def _send(self, user_text: str) -> None:
+        self._chat_busy = True
         self._user_message(user_text)
         self._start_ai_message()
         self._run_chat(user_text)
@@ -438,10 +643,23 @@ class MemeTUI(App):
     @work(thread=True)
     def _run_chat(self, user_text: str) -> None:
         if self.session is None:
+            task = user_text
+            if self._proactive_prefix:
+                task = f"reply to proactive: {self._proactive_prefix} — {user_text}"
             try:
                 self.session = session_mgr.start(
-                    task=user_text, tags=[], config=CONFIG, project_root=ROOT,
+                    task=task, tags=[], config=CONFIG, project_root=ROOT,
                 )
+                # Inject the referenced proactive node into retrieved context
+                # for the first turn so the model has grounding without a new
+                # retrieval call.
+                if self._proactive_node_path:
+                    existing = list(self.session.get("retrieved_files") or [])
+                    if self._proactive_node_path not in existing:
+                        existing.insert(0, self._proactive_node_path)
+                    self.session["retrieved_files"] = existing
+                self._proactive_prefix = None
+                self._proactive_node_path = None
                 self.messages = []
                 self.transcript = []
                 self.call_from_thread(
@@ -457,9 +675,10 @@ class MemeTUI(App):
         window = CONFIG["session"]["history_window"]
 
         agentic = (CONFIG.get("session") or {}).get("agentic_model1", True)
+        tool_log: list[dict[str, Any]] = []
         try:
             if agentic:
-                raw, _tool_log = reflection.chat_with_tools(
+                raw, tool_log = reflection.chat_with_tools(
                     role="model1",
                     system=self.session["system_prompt"],
                     messages=self.messages[-window:],
@@ -490,6 +709,14 @@ class MemeTUI(App):
 
         self.messages.append({"role": "assistant", "content": reply})
         self.transcript.append(f"## ASSISTANT\n{reply}")
+        for call in tool_log:
+            tname = call.get("tool", "")
+            if not str(tname).startswith("obsidian_"):
+                continue
+            args = call.get("args") or {}
+            rel = args.get("rel_path") or args.get("folder") or args.get("query") or ""
+            label = tname.replace("obsidian_", "")
+            self.call_from_thread(self._system_message, f"📝 {label}: {rel}")
         self.call_from_thread(self._finish_ai_message, reply)
 
     # ----- session lifecycle -----------------------------------------
@@ -584,6 +811,7 @@ class MemeTUI(App):
             self._current_ai.update_content(content)
             self._current_ai = None
         self._last_reply = content
+        self._chat_busy = False
         self._chat_container.scroll_end(animate=False)
 
 

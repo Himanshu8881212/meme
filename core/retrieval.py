@@ -15,6 +15,11 @@ try:
 except ImportError:
     _BM25 = None  # type: ignore[assignment]
 
+try:
+    from core import embeddings as _emb
+except Exception:  # pragma: no cover
+    _emb = None  # type: ignore[assignment]
+
 WORD = re.compile(r"[A-Za-z0-9_]+")
 
 
@@ -126,6 +131,26 @@ def select_entry_points(
     return [name for score, name in scored[:n] if score > 0]
 
 
+def _rrf_fuse(
+    rankings: list[list[str]],
+    n: int,
+    k: int = 60,
+) -> list[str]:
+    """Reciprocal-rank fusion: combine multiple ranked lists into one.
+
+    A node's fused score is Σ 1/(k + rank_in_list_i). Whichever list a node
+    appears in contributes — so a node strong under BM25 OR embeddings wins
+    ties, and a node strong under BOTH lenses wins outright. k=60 is the
+    standard tuning constant from the original RRF paper.
+    """
+    scores: dict[str, float] = {}
+    for ranking in rankings:
+        for rank, name in enumerate(ranking):
+            scores[name] = scores.get(name, 0.0) + 1.0 / (k + rank)
+    fused = sorted(scores.items(), key=lambda p: p[1], reverse=True)
+    return [name for name, _ in fused[:n]]
+
+
 def expand_graph(
     vault_path: str | Path,
     index: dict[str, dict[str, Any]],
@@ -170,13 +195,33 @@ def retrieve(
     if len(index) > r["dense_vault_threshold"]:
         hops = max(hops - 1, 1)
 
-    entries = select_entry_points(
+    # Lens 1: BM25 + tag + title + decay — current scoring path.
+    lex_entries = select_entry_points(
         index=index,
         context=context,
         context_tags=context_tags,
         weights=r["weights"],
         n=r["entry_points"],
     )
+
+    # Lens 2: semantic embeddings (opt-in via config). Runs only when the
+    # sentence-transformers dep is installed and an index has been built.
+    entries: list[str]
+    semantic_on = bool(r.get("semantic")) and _emb is not None and _emb.is_available()
+    if semantic_on:
+        sem_top_k = int(r.get("semantic_top_k", r["entry_points"]))
+        sem_pairs = _emb.semantic_seeds(vault_path, context, k=sem_top_k)
+        # Filter out names not in current index (archived/transcript after build).
+        sem_entries = [n for n, _ in sem_pairs if n in index]
+        # Fuse via reciprocal-rank fusion — keeps each lens's best picks near
+        # the top, rewards agreement between them.
+        entries = _rrf_fuse(
+            [lex_entries, sem_entries],
+            n=r["entry_points"],
+        )
+    else:
+        entries = lex_entries
+
     paths = expand_graph(vault_path, index, entries, hops)
 
     out: list[tuple[str, str]] = []

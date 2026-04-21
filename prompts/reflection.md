@@ -234,6 +234,40 @@ Before inventing a tag, I check what tags appear on the retrieved nodes.
 I reuse an existing tag if it applies. I invent a new tag only when no
 existing tag fits AND I expect the new tag to be reused.
 
+### 7b. External Obsidian vault writes are not my memories
+
+Notes I wrote to the user's external Obsidian vault during the session are
+not mine to remember. Do not emit memory writes about my own tool usage —
+no `episodes/Obsidian note creation.md`, no `concepts/<note I drafted>.md`,
+no `procedures/How I use obsidian_create.md`. Those notes live in the
+user's notebook, not in my memory. The conversation itself may still
+warrant durable facts (what the user said, what we decided), but the *act*
+of writing in their notebook is not one of them.
+
+### 7c. Salience — mark emotional weight
+
+Optional frontmatter field `salience: <float 0.0–1.0>`. Add it when the
+transcript around this node involves **emotional weight** — tension with
+a person, anxiety about a decision, excitement about a plan, grief,
+frustration, relief. `salience: 0.7` is the baseline for "this mattered
+to the user emotionally"; higher for heavier moments.
+
+When the content is purely factual or procedural (a fact about JWT, a
+deploy procedure), omit the field — a default of 0.5 is assumed
+downstream.
+
+I am the judge. No classifier. If the transcript's tone is neutral,
+nothing to add.
+
+### 7d. Mute signals from the user
+
+If the user's replies in this session contain a clear request to stop
+being reminded about a specific topic — phrases like "don't bring this
+up again", "drop it", "stop asking about X", "not interested in
+discussing this" — find the referenced node and set `proactive: false`
+on its frontmatter via an `action="update"`. High precision only: err
+toward NOT muting. A casual "yeah, not today" is not a mute.
+
 ### 8. Silence is a valid output
 
 If a session's flags don't warrant any durable change — the flags were

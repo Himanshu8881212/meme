@@ -59,17 +59,22 @@ from core import tools as vault_tools
 # iteratively walk its memory graph across multiple hops — "find the author
 # of X" → "find that author's spouse" → "find their citizenship" — instead
 # of one-shot retrieval that can only surface one hop of context.
-MODEL1_TOOL_SCHEMAS = [
+#
+# Obsidian tools (below) are ONLY included when `external_vault.path` is set;
+# see model1_tool_schemas().
+MEMORY_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
             "name": "memory_search",
             "description": (
-                "Search my memory for notes related to a topic. Returns the most "
-                "relevant nodes as concatenated markdown. Call this when the user "
-                "asks about something I might remember. Also call this iteratively "
-                "when answering a question that requires chaining multiple facts "
-                "(e.g. 'the spouse of the author of X' = one search per hop)."
+                "Ranked top-K search over my memory (BM25 + embeddings + graph). "
+                "Returns the most relevant nodes as concatenated markdown. "
+                "Best for SPECIFIC questions — 'who is X', 'when did Y happen', "
+                "chaining facts ('the author of X', then 'their spouse'). "
+                "**Do NOT use for 'all of X' or 'everything about Y' questions** "
+                "— top-K will silently drop the long tail. For those, use "
+                "memory_list followed by memory_summarize instead."
             ),
             "parameters": {
                 "type": "object",
@@ -161,11 +166,14 @@ MODEL1_TOOL_SCHEMAS = [
         "function": {
             "name": "memory_list",
             "description": (
-                "Cheap metadata-only enumeration of my vault: returns a list "
-                "of {name, type, tags, importance} dicts — NO bodies, NO token "
-                "cost per node. Use BEFORE memory_summarize to pick which "
-                "nodes to distill. Great for questions like 'all concepts I "
-                "hold about meditation' or 'every entity tagged family'."
+                "**Use this for aggregate/completeness questions** — anything "
+                "like 'everything about X', 'summarize all Y', 'all my Z', "
+                "'health history of ...', 'over the past year ...'. Returns "
+                "the FULL list of matching node names cheaply (metadata only, "
+                "no bodies), so you can then call memory_summarize on them. "
+                "This is the RIGHT tool when top-N ranked retrieval would "
+                "miss important items. Prefer this over memory_search whenever "
+                "the user's question implies 'all' or 'entire'."
             ),
             "parameters": {
                 "type": "object",
@@ -186,12 +194,14 @@ MODEL1_TOOL_SCHEMAS = [
         "function": {
             "name": "memory_summarize",
             "description": (
-                "Recursive distillation: feed N node names plus a focus "
-                "question, get back a single paragraph synthesized by a "
-                "sub-call. Use when many nodes are relevant but their full "
-                "bodies would blow up my context. Pair with memory_list to "
-                "first collect the candidate set, then collapse it here. "
-                "This is how I stay coherent on vault-scale queries."
+                "Second half of the aggregate-query pattern: feed ≤30 node "
+                "names + a focus question, get back ONE distilled paragraph. "
+                "A separate sub-call reads every body and condenses them, "
+                "so this is how you answer 'summarize all X' without "
+                "dumping 30 full nodes into my context. **Workflow:** first "
+                "call memory_list → then pass those names here → use the "
+                "returned paragraph in your reply. Don't skip this step for "
+                "'everything about' / 'full history of' questions."
             ),
             "parameters": {
                 "type": "object",
@@ -211,6 +221,358 @@ MODEL1_TOOL_SCHEMAS = [
         },
     },
 ]
+
+# Home-assistant-style capabilities: eyes, voice self-control, clock,
+# timers, web search. Always registered — each gracefully reports back if
+# its runtime backend isn't loaded in the current process.
+UTILITY_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "capture_camera",
+            "description": (
+                "Turn the camera on NOW, capture a short burst of frames, "
+                "analyze them with a vision model, then close the camera. "
+                "Use when the user asks about something physically present — "
+                "'what is this', 'describe what you see', 'look at my desk', "
+                "'what's on the screen'. Returns a paragraph describing "
+                "the scene. Do NOT use just because vision MIGHT help — only "
+                "when the user's question clearly needs eyes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "What to describe / look for.",
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mute_self",
+            "description": (
+                "Stop speaking out loud (TTS off). Use when the user says "
+                "'stay quiet', 'shush', 'stop talking', 'be silent for N "
+                "minutes'. Text replies still appear in chat — only the "
+                "audio is suppressed. Optionally auto-unmute after N seconds."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "duration_seconds": {
+                        "type": "integer",
+                        "description": "Auto-unmute after this many seconds. Omit for indefinite.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "unmute_self",
+            "description": "Resume speaking out loud (turn TTS back on).",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "current_time",
+            "description": (
+                "Current wall-clock time + date in the user's local timezone. "
+                "Use whenever the user asks for the time, today's date, day "
+                "of the week, or whenever a response's correctness depends "
+                "on 'now'."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_timer",
+            "description": (
+                "Schedule a proactive reminder. After `seconds` pass, Samantha "
+                "will post a system line AND speak the message aloud. Use for "
+                "'remind me in 10 minutes to X', 'set a 5 minute timer', "
+                "'wake me in an hour'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "seconds": {"type": "integer", "description": "How long to wait before firing."},
+                    "message": {"type": "string", "description": "What to say when the timer fires."},
+                },
+                "required": ["seconds", "message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_reminder",
+            "description": (
+                "Schedule a reminder at a specific time or on a recurring "
+                "cron schedule. Unlike set_timer (relative seconds), this "
+                "survives TUI restarts — it's persisted in the vault and "
+                "fires whenever Samantha is running. Provide EITHER `cron` "
+                "(standard 5-field) or `once_at` (ISO datetime), not both.\n"
+                "Cron examples:\n"
+                "  '0 9 * * 1-5'  → every weekday at 9:00\n"
+                "  '0 18 * * 1'   → every Monday at 18:00\n"
+                "  '0 8 1 * *'    → 8 AM on the 1st of every month\n"
+                "  '*/15 * * * *' → every 15 minutes\n"
+                "Once_at example: '2026-04-25T15:30'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "What to say when it fires."},
+                    "cron": {"type": "string", "description": "Cron expression (recurring)."},
+                    "once_at": {"type": "string", "description": "ISO datetime (one-shot)."},
+                },
+                "required": ["message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_reminders",
+            "description": (
+                "List every scheduled reminder in the vault (id, message, "
+                "cron/once_at, next_fire). Use when the user asks what's "
+                "scheduled, or to find an id before cancelling."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_reminder",
+            "description": "Remove a scheduled reminder by its id.",
+            "parameters": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Free web search via DuckDuckGo. Use for current info beyond "
+                "my knowledge cutoff — news, prices, live facts, recent "
+                "events. Returns up to `max_results` hits as title / url / "
+                "snippet triples. Summarize the findings in your reply; "
+                "don't dump the raw URLs at the user."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Default 5, max 10.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+OBSIDIAN_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "obsidian_create",
+            "description": (
+                "Create a new note in the user's external Obsidian vault. Use "
+                "this when the user asks you to capture a thought, draft "
+                "something, organize an idea, or create a reference note. This "
+                "writes to THEIR notebook, not yours — you will not remember "
+                "this action in your own memory. Always call obsidian_list or "
+                "obsidian_search first to check for existing notes on the same "
+                "topic."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rel_path": {"type": "string",
+                                 "description": "Vault-relative path, e.g. 'Projects/Foo.md'."},
+                    "body": {"type": "string",
+                             "description": "Full markdown body."},
+                    "frontmatter": {"type": "object",
+                                    "description": "Optional YAML frontmatter."},
+                },
+                "required": ["rel_path", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "obsidian_update",
+            "description": (
+                "Update an existing note in the user's Obsidian vault. Writes "
+                "to THEIR notebook, not your memory. Use mode=append to add to "
+                "the end (safest for ongoing notes), prepend for the top, or "
+                "replace to overwrite entirely."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rel_path": {"type": "string"},
+                    "body": {"type": "string"},
+                    "mode": {"type": "string",
+                             "enum": ["replace", "append", "prepend"],
+                             "description": "Default: replace."},
+                },
+                "required": ["rel_path", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "obsidian_read",
+            "description": (
+                "Read a note from the user's Obsidian vault. Use this when the "
+                "user asks 'what did I write about X' or when you need context "
+                "from their existing notes before adding to them."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rel_path": {"type": "string"},
+                },
+                "required": ["rel_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "obsidian_search",
+            "description": (
+                "Case-insensitive phrase search across the user's Obsidian "
+                "vault. Returns matching lines with paths. Use before creating "
+                "a new note to avoid duplicating an existing one."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "obsidian_list",
+            "description": (
+                "List note paths in the user's Obsidian vault, optionally "
+                "filtered to a folder. Use to orient yourself before writing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "folder": {"type": "string",
+                               "description": "Vault-relative folder, or omit for root."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "obsidian_link",
+            "description": (
+                "Append a wikilink to an existing note in the user's Obsidian "
+                "vault. Writes to THEIR notebook, not your memory."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rel_path": {"type": "string"},
+                    "target": {"type": "string",
+                               "description": "Wikilink target (without [[ ]])."},
+                    "label": {"type": "string",
+                              "description": "Optional display label."},
+                },
+                "required": ["rel_path", "target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "obsidian_rename",
+            "description": (
+                "Rename / move a note in the user's Obsidian vault. Updates "
+                "every incoming `[[wikilink]]` across the vault so nothing "
+                "breaks. Use when the user asks to rename or move a note."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "old_rel": {"type": "string", "description": "Current relative path (.md optional)."},
+                    "new_rel": {"type": "string", "description": "New relative path (.md optional)."},
+                },
+                "required": ["old_rel", "new_rel"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "obsidian_delete",
+            "description": (
+                "Soft-delete a note from the user's Obsidian vault — moves it "
+                "to `_trash/` (reversible). Use when the user explicitly asks "
+                "to delete / remove / throw out a note. Always confirm the "
+                "exact note via `obsidian_list` or `obsidian_search` first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rel_path": {"type": "string"},
+                },
+                "required": ["rel_path"],
+            },
+        },
+    },
+]
+
+
+def model1_tool_schemas(config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Memory tools + utility tools always; obsidian_* only when
+    external_vault.path is set."""
+    from core import obsidian as _ob
+    vault = _ob.resolve_vault_path(config)
+    base = list(MEMORY_TOOL_SCHEMAS) + list(UTILITY_TOOL_SCHEMAS)
+    if vault is None:
+        return base
+    return base + list(OBSIDIAN_TOOL_SCHEMAS)
+
+
+# Back-compat alias — some callers (and older tests) still reference the old
+# static name. The default list matches the old behaviour: memory tools only.
+MODEL1_TOOL_SCHEMAS = MEMORY_TOOL_SCHEMAS
 
 ALLOWED_FOLDERS = {
     "entities", "concepts", "decisions", "episodes",
@@ -563,6 +925,72 @@ def _model1_tool_dispatch(
             return "(no matching nodes)"
         return f"{len(rows)} node(s):\n" + "\n".join(rows)
 
+    if name.startswith("obsidian_"):
+        from core import obsidian as _ob
+        ext = _ob.resolve_vault_path(config)
+        if ext is None:
+            return "(external Obsidian vault is not configured)"
+        try:
+            if name == "obsidian_create":
+                r = _ob.create_note(
+                    ext,
+                    str(args.get("rel_path", "")),
+                    str(args.get("body", "")),
+                    frontmatter=args.get("frontmatter") or None,
+                    config=config,
+                )
+            elif name == "obsidian_update":
+                r = _ob.update_note(
+                    ext,
+                    str(args.get("rel_path", "")),
+                    str(args.get("body", "")),
+                    mode=str(args.get("mode", "replace")),
+                    config=config,
+                )
+            elif name == "obsidian_read":
+                return _ob.read_note(ext, str(args.get("rel_path", "")))
+            elif name == "obsidian_search":
+                hits = _ob.search_notes(ext, str(args.get("query", "")))
+                if not hits:
+                    return "(no matches)"
+                return "\n".join(
+                    f"{h['path']}:{h['line_no']}: {h['snippet']}" for h in hits
+                )
+            elif name == "obsidian_list":
+                folder = args.get("folder")
+                out = _ob.list_notes(ext, folder if folder else None)
+                return "\n".join(out) if out else "(no notes)"
+            elif name == "obsidian_link":
+                r = _ob.add_wikilink(
+                    ext,
+                    str(args.get("rel_path", "")),
+                    str(args.get("target", "")),
+                    label=args.get("label") or None,
+                    config=config,
+                )
+            elif name == "obsidian_rename":
+                r = _ob.rename_note(
+                    ext,
+                    str(args.get("old_rel", "")),
+                    str(args.get("new_rel", "")),
+                    config=config,
+                )
+            elif name == "obsidian_delete":
+                r = _ob.delete_note(
+                    ext,
+                    str(args.get("rel_path", "")),
+                    config=config,
+                )
+            else:
+                return f"unknown tool: {name}"
+        except Exception as exc:
+            return f"obsidian error: {exc}"
+        if isinstance(r, dict):
+            if r.get("ok"):
+                return r.get("preview") or f"{name} ok"
+            return f"error: {r.get('error', 'unknown')}"
+        return str(r)
+
     if name == "memory_summarize":
         names = args.get("names") or []
         if not isinstance(names, list):
@@ -578,10 +1006,23 @@ def _model1_tool_dispatch(
         joined = "\n\n".join(blocks)
         sub_system = (
             "You are a focused summarizer. The user will give you a set of "
-            "vault nodes and a query. Produce ONE tight paragraph (≤ 180 "
-            "words) answering the query using ONLY those nodes. If the "
-            "nodes don't contain the answer, say so in one sentence. Do "
-            "not invent facts. Do not reference node names unless asked."
+            "vault nodes and a query. Produce ONE tight paragraph (≤ 220 "
+            "words) answering the query using ONLY those nodes.\n\n"
+            "Non-negotiable rules:\n"
+            "1. **Preserve patterns.** If several nodes describe the same "
+            "kind of event (e.g. 3 separate appetite drops, 2 thunderstorm "
+            "panics, 4 vet visits), say so explicitly — 'three times in the "
+            "past month', 'recurring every spring', 'the second incident in "
+            "a week'. NEVER collapse a pattern into a single 'one-time' "
+            "event.\n"
+            "2. **Keep specific dates and numbers** when the nodes give "
+            "them. '32kg, down from 34' is better than 'lost weight'.\n"
+            "3. **Flag what's ongoing vs resolved.** If the latest node on "
+            "a topic leaves something open ('monitoring', 'messaged vet'), "
+            "the summary must reflect that — don't round it up to 'fine'.\n"
+            "4. **Use only the supplied nodes.** No invented facts, no "
+            "general knowledge filler.\n"
+            "5. **No node-name citations** unless the query asked for them."
         )
         sub_user = (
             f"Query: {query}\n\n"
@@ -593,11 +1034,176 @@ def _model1_tool_dispatch(
                 system=sub_system,
                 messages=[{"role": "user", "content": sub_user}],
                 config=config,
-                max_tokens=512,
+                max_tokens=768,
             )
         except Exception as exc:
             return f"(summarize failed: {exc})"
         return summary.strip() or "(sub-call returned nothing)"
+
+    # ── utility tools (camera / voice / clock / timer / web) ────────────
+    # These reach into the live process via core.runtime — handles are
+    # set at TUI mount. Each tool fails gracefully if its backend isn't
+    # available (e.g. no camera, no ddgs install).
+
+    if name == "capture_camera":
+        from core import runtime as _rt
+        video = _rt.get("video")
+        if video is None:
+            return "(camera unavailable — no video backend in this process)"
+        ok, reason = video.start()
+        if not ok:
+            return f"(camera failed to open: {reason})"
+        time.sleep(1.0)  # let the user point it, grab a real burst of frames
+        frames = video.stop(3)
+        if not frames:
+            return "(camera opened but captured no usable frames)"
+        question = str(args.get("question") or "Describe what you see.")
+        parts: list[dict[str, Any]] = [{"type": "text", "text": question}]
+        for url in frames:
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+        role = "vision" if "vision" in (config.get("models") or {}) else "model1"
+        try:
+            description = chat(
+                role=role,
+                system=(
+                    "You are a precise vision describer. Answer the user's "
+                    "question about the attached image(s) in one tight paragraph. "
+                    "Name what's visible concretely; skip filler."
+                ),
+                messages=[{"role": "user", "content": parts}],
+                config=config,
+                max_tokens=512,
+            )
+        except Exception as exc:
+            return f"(vision sub-call failed: {exc})"
+        return (description or "").strip() or "(vision returned no description)"
+
+    if name == "mute_self":
+        from core import runtime as _rt
+        voice = _rt.get("voice")
+        if voice is None:
+            return "(no voice backend — already silent)"
+        voice.muted = True
+        dur = args.get("duration_seconds")
+        if dur:
+            try:
+                secs = max(1, int(dur))
+            except (TypeError, ValueError):
+                secs = 0
+            if secs:
+                def _auto_unmute():
+                    v = _rt.get("voice")
+                    if v is not None:
+                        v.muted = False
+                    app = _rt.get("app")
+                    if app is not None:
+                        try:
+                            app.call_from_thread(app._sys, "🔊 auto-unmuted.")
+                        except Exception:
+                            pass
+                import threading as _th
+                _th.Timer(float(secs), _auto_unmute).start()
+                mins, rem = divmod(secs, 60)
+                return f"muted for {mins}m {rem}s — I'll turn sound back on then."
+        return "muted. say '/listen on' and ask me to unmute when you want audio back."
+
+    if name == "unmute_self":
+        from core import runtime as _rt
+        voice = _rt.get("voice")
+        if voice is None:
+            return "(no voice backend)"
+        voice.muted = False
+        return "unmuted."
+
+    if name == "current_time":
+        from datetime import datetime as _dt
+        now = _dt.now().astimezone()
+        tz = now.tzname() or "local"
+        return now.strftime("%A, %B %d %Y — %I:%M %p ") + tz
+
+    if name == "set_timer":
+        from core import runtime as _rt
+        try:
+            seconds = int(args.get("seconds", 0))
+        except (TypeError, ValueError):
+            seconds = 0
+        message = str(args.get("message") or "timer done")
+        if seconds <= 0:
+            return "(timer needs a positive number of seconds)"
+
+        def _fire():
+            voice = _rt.get("voice")
+            app = _rt.get("app")
+            text = f"⏰ timer: {message}"
+            if app is not None:
+                try:
+                    app.call_from_thread(app._sys, text)
+                except Exception:
+                    pass
+            if voice is not None and not voice.muted:
+                voice.speak(message)
+        import threading as _th
+        _th.Timer(float(seconds), _fire).start()
+        mins, rem = divmod(seconds, 60)
+        return f"timer set — in {mins}m {rem}s I'll remind you: {message!r}"
+
+    if name == "schedule_reminder":
+        from core import cron as _cron
+        msg = str(args.get("message") or "").strip()
+        cron_expr = args.get("cron") or None
+        once_at = args.get("once_at") or None
+        r = _cron.add(vault, msg, cron=cron_expr, once_at=once_at)
+        if not r.get("ok"):
+            return f"error: {r.get('error')}"
+        e = r["entry"]
+        when = f"cron `{e['cron']}`" if e.get("cron") else f"at {e.get('once_at')}"
+        return f"reminder scheduled (id {e['id']}): {when} · {e['message']!r} · next: {e['next_fire']}"
+
+    if name == "list_reminders":
+        from core import cron as _cron
+        entries = _cron.active(vault)
+        if not entries:
+            return "(no scheduled reminders)"
+        lines = ["scheduled reminders:"]
+        for e in entries:
+            when = f"cron `{e['cron']}`" if e.get("cron") else f"once {e.get('once_at')}"
+            lines.append(f"  {e['id']}  {when}  next: {e.get('next_fire')}  · {e['message']!r}")
+        return "\n".join(lines)
+
+    if name == "cancel_reminder":
+        from core import cron as _cron
+        rid = str(args.get("id") or "").strip()
+        if not rid:
+            return "(missing id)"
+        ok = _cron.remove(vault, rid)
+        return f"removed reminder {rid}." if ok else f"no reminder with id {rid}."
+
+    if name == "web_search":
+        try:
+            from ddgs import DDGS
+        except Exception:
+            return "(web_search unavailable — pip install ddgs)"
+        q = str(args.get("query") or "").strip()
+        if not q:
+            return "(empty query)"
+        try:
+            limit = min(max(int(args.get("max_results") or 5), 1), 10)
+        except (TypeError, ValueError):
+            limit = 5
+        try:
+            with DDGS() as d:
+                results = list(d.text(q, max_results=limit))
+        except Exception as exc:
+            return f"(web_search error: {exc})"
+        if not results:
+            return "(no results)"
+        lines: list[str] = []
+        for r in results:
+            title = (r.get("title") or "")[:120]
+            href = r.get("href") or r.get("url") or ""
+            body = (r.get("body") or "")[:280]
+            lines.append(f"— {title}\n  {href}\n  {body}")
+        return "\n\n".join(lines)
 
     return f"unknown tool: {name}"
 
@@ -635,13 +1241,15 @@ def chat_with_tools(
     ]
     call_log: list[dict[str, Any]] = []
 
+    schemas = model1_tool_schemas(config)
+
     for _ in range(max_rounds):
         resp = _create_with_retry(
             client,
             max_retries=retries, backoff_base_sec=backoff,
             model=model, max_tokens=max_tokens,
             messages=msgs,
-            tools=MODEL1_TOOL_SCHEMAS,
+            tools=schemas,
             tool_choice="auto",
         )
         msg = resp.choices[0].message
@@ -1058,5 +1666,18 @@ def apply_writes(
                 "action": "reconciled",
                 "source_tension": r["tension"],
             })
+
+    # Refresh the semantic index if any write actually landed — new/changed
+    # nodes are otherwise invisible to paraphrase retrieval until a manual
+    # rebuild. Lazy: only re-encodes changed hashes. Silent on failure so
+    # an embeddings-less install still works.
+    if applied and any(a.get("action") in ("create", "update", "reconciled", "deleted")
+                       for a in applied):
+        try:
+            from core import embeddings as _emb
+            if _emb.is_available():
+                _emb.build_index(vault)
+        except Exception:
+            pass
 
     return applied

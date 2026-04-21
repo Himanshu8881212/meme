@@ -28,25 +28,20 @@ providers:
     base_url: null
     api_key_env: null
 
-# Each role picks a provider + model id. Default: Mistral, three tiers.
+# One model everywhere: Magistral Small is multimodal (text + vision), so a
+# single role covers chat, reflection, deep audit, and camera frames. The
+# code falls back to `model1` for vision calls when no separate `vision`
+# role is configured — exactly what we want here.
 models:
-  # All three tiers on magistral-medium (the largest magistral reasoning model —
-  # magistral-large doesn't exist in Mistral's catalog as of this writing).
   model1:
     provider: mistral
-    model: magistral-medium-latest
+    model: magistral-small-latest
   routine:
     provider: mistral
-    model: magistral-medium-latest
+    model: magistral-small-latest
   deep:
     provider: mistral
-    model: magistral-medium-latest
-  # Vision — used by samantha's "hold ⌘ to see" mode. Takes image parts
-  # alongside the transcribed audio. Falls back to model1 if this key is
-  # missing. Pixtral is Mistral's multimodal workhorse.
-  vision:
-    provider: mistral
-    model: pixtral-large-latest
+    model: magistral-small-latest
 
 retrieval:
   entry_points: 8
@@ -61,6 +56,14 @@ retrieval:
     body_bm25: 0.30
     decay_weight: 0.10
     recency: 0.10
+  # Hybrid semantic lens — adds a second seed generator alongside BM25.
+  # BM25 catches verbatim recall; embeddings catch paraphrase ("my dog" ↔
+  # "Puppet"); wikilinks catch multi-hop. Combined via reciprocal-rank
+  # fusion. Requires `pip install sentence-transformers` (or see
+  # requirements-embeddings.txt). Disable by flipping to false.
+  semantic: true
+  semantic_top_k: 10
+  semantic_model: sentence-transformers/all-MiniLM-L6-v2
 
 decay:
   # λ=0.02 → ~35-day half-life. Softer than the old λ=0.05 (~14 days) so
@@ -111,3 +114,33 @@ session:
 mcp:
   server_name: memory-system
   default_search_limit: 8
+
+# Proactive outreach — Samantha-initiated messages surfaced at TUI startup.
+# Disabled by default (explicit opt-in). Every surface is grounded in a
+# specific vault node, rate-limited hard, and auditable via
+# `vault/_meta/outreach_log.md`.
+proactive:
+  enabled: true
+  daily_cap: 3
+  min_score_threshold: 0.55
+  min_gap_hours: 4
+  min_silence_hours: 2
+  quiet_hours: [22, 9]               # [start, end_exclusive] local clock
+  timezone: auto
+  weights:
+    importance: 0.35
+    urgency: 0.25
+    salience: 0.20
+    connection_density: 0.10
+    freshness: 0.10
+
+# Second, orthogonal vault — the USER's Obsidian notebook. Samantha writes
+# into it on the user's behalf via her obsidian_* tools. These writes are
+# NOT memories — reflection, decay, and retrieval never touch this vault.
+# Set `path: null` to disable (the obsidian_* tools will be hidden from the
+# model's schema entirely).
+external_vault:
+  path: "/Users/himanshu/Personal /Personal Vault"
+  git_auto_commit: true
+  audit_log: .meme_audit.log
+  protected_folders: []

@@ -67,7 +67,7 @@ from textual import work
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from core import reflection  # noqa: E402
+from core import obsidian, outreach, proactive, reflection  # noqa: E402
 from scheduler import session as session_mgr  # noqa: E402
 from utils import env  # noqa: E402
 from tui_common import (  # noqa: E402
@@ -472,11 +472,21 @@ class SamanthaTUI(App):
         self._input_history: list[str] = []
         self._history_idx: int = 0
         self._last_reply: str = ""
+        # True while a chat worker is running — blocks concurrent sends.
+        self._chat_busy: bool = False
+        # Proactive outreach state (see tui.py).
+        self._proactive_prefix: str | None = None
+        self._proactive_node_path: str | None = None
         # Which PTT modifier is currently held: "audio" (Option), "vision"
         # (Command), or None. Set on press, cleared on release. Ensures
         # that releasing a different modifier doesn't stop a recording
         # started by the first one.
         self._ptt_mode: str | None = None
+        # ⌘ debounce — the Cmd key fires a BAZILLION system shortcuts
+        # (Cmd+V, Cmd+Tab, Cmd+Space). We refuse to start recording until
+        # Cmd has been held *alone* for PTT_CMD_HOLD_MS with no other key.
+        self._cmd_pending_since: float | None = None
+        self._cmd_cancelled: bool = False
 
     def compose(self) -> ComposeResult:
         yield Container(
@@ -550,6 +560,19 @@ class SamanthaTUI(App):
                 "opencv-python not installed — hold-⌘ camera mode disabled. "
                 "install: pip install opencv-python"
             )
+
+        ext = obsidian.resolve_vault_path(CONFIG)
+        if ext is not None:
+            head = obsidian.git_head(ext) or "no git"
+            self._system_message(
+                f"external vault: {ext}  (notes: {obsidian.note_count(ext)}, git: {head})"
+            )
+        else:
+            self._system_message(
+                "external vault: (disabled — set external_vault.path in config.yaml)"
+            )
+
+        self._maybe_surface_proactive()
 
     # ----- sidebar / transcripts --------------------------------------
 
@@ -641,7 +664,197 @@ class SamanthaTUI(App):
         if text.lower() in ("quit", "exit", "bye", ":q"):
             self.action_quit()
             return
+        if text.startswith("/obsidian"):
+            arg = text[len("/obsidian"):].strip()
+            self._cmd_obsidian(arg)
+            return
+        if text.startswith("/"):
+            parts = text.split(maxsplit=1)
+            cmd = parts[0].lstrip("/").lower()
+            arg = parts[1] if len(parts) > 1 else ""
+            if cmd == "whats_up":
+                self._cmd_whats_up()
+                return
+            if cmd == "outreach":
+                self._cmd_outreach(arg)
+                return
+            if cmd == "pause":
+                self._cmd_pause(arg)
+                return
+            if cmd == "mute":
+                self._cmd_mute(arg)
+                return
+            if cmd == "unmute":
+                self._cmd_unmute(arg)
+                return
+        if self._chat_busy:
+            self._system_message("(still thinking — hold on a moment.)")
+            return
         self._send(text)
+
+    # ----- proactive outreach --------------------------------------------
+    def _maybe_surface_proactive(self) -> None:
+        pcfg = (CONFIG.get("proactive") or {})
+        if not pcfg.get("enabled"):
+            return
+        if outreach.active_pause(VAULT) is not None:
+            return
+        try:
+            ctx = outreach.build_context(VAULT, CONFIG)
+            cs = proactive.candidates(VAULT, CONFIG)
+            pick = proactive.should_reach_out(cs, ctx, CONFIG)
+        except Exception as exc:
+            self._system_message(f"(proactive: {exc})")
+            return
+        if pick is None:
+            return
+        self._system_message(f"📬 I've been thinking about {pick['node_name']}...")
+        self._run_proactive_draft(pick)
+
+    @work(thread=True)
+    def _run_proactive_draft(self, pick: dict[str, Any]) -> None:
+        try:
+            msg = outreach.draft_message(pick, VAULT, CONFIG)
+        except Exception as exc:
+            self.call_from_thread(self._system_message, f"(outreach draft failed: {exc})")
+            return
+        try:
+            outreach.log_outreach(VAULT, pick, msg, delivered=True)
+        except Exception:
+            pass
+        self.call_from_thread(self._ai_message, msg)
+        # Speak it — samantha's a voice agent, the nudge should be heard
+        # not just read. Cleans markdown/flags before TTS so no symbols leak.
+        if self.voice and not self.voice.muted:
+            self.voice.speak(clean_for_speech(msg))
+        self._proactive_prefix = pick["node_name"]
+        self._proactive_node_path = pick.get("node_path")
+
+    def _cmd_whats_up(self) -> None:
+        try:
+            cs = proactive.candidates(VAULT, CONFIG)
+        except Exception as exc:
+            self._system_message(f"whats_up error: {exc}")
+            return
+        if not cs:
+            self._system_message("(nothing on my mind — no candidates)")
+            return
+        lines = ["top candidates (read-only):"]
+        for c in cs[:3]:
+            reasons = "; ".join(c.get("reasons") or []) or "-"
+            lines.append(
+                f"  {c['score']:.2f}  [{c.get('node_type','?')}] {c['node_name']}"
+                f"  — {reasons}"
+            )
+        self._system_message("\n".join(lines))
+
+    def _cmd_outreach(self, arg: str) -> None:
+        sub = (arg or "").strip().lower()
+        if sub == "status":
+            pcfg = (CONFIG.get("proactive") or {})
+            pause = outreach.active_pause(VAULT)
+            ctx = outreach.build_context(VAULT, CONFIG)
+            lines = [
+                f"enabled: {bool(pcfg.get('enabled'))}",
+                f"paused until: {pause.isoformat(timespec='seconds') if pause else '-'}",
+                f"delivered today: {ctx['outreaches_today']}  (cap={pcfg.get('daily_cap', 3)})",
+            ]
+            hs = ctx.get("hours_since_last_outreach")
+            if hs is not None:
+                lines.append(f"hours since last outreach: {hs:.1f}")
+            self._system_message("\n".join(lines))
+            return
+        entries = outreach.tail_log(VAULT, n=10)
+        if not entries:
+            self._system_message("(outreach log is empty)")
+            return
+        lines = ["last outreaches:"]
+        for e in entries:
+            lines.append(
+                f"  {e['ts'].isoformat(timespec='seconds')}  "
+                f"score={e['score']:.2f}  delivered={e['delivered']}  {e['node']}"
+            )
+        self._system_message("\n".join(lines))
+
+    def _cmd_pause(self, arg: str) -> None:
+        arg = (arg or "").strip()
+        if arg.lower() == "off":
+            if outreach.clear_pause(VAULT):
+                self._system_message("proactive: unpaused.")
+            else:
+                self._system_message("no pause was active.")
+            return
+        until = outreach.parse_pause_arg(arg)
+        if until is None:
+            self._system_message(
+                "usage: /pause 24h  |  /pause until 2026-05-01  |  /pause off"
+            )
+            return
+        outreach.set_pause(VAULT, until)
+        self._system_message(
+            f"proactive: paused until {until.isoformat(timespec='seconds')}."
+        )
+
+    def _cmd_mute(self, arg: str) -> None:
+        name = (arg or "").strip()
+        if not name:
+            self._system_message("usage: /mute <node name>")
+            return
+        if outreach.set_node_proactive(VAULT, name, False):
+            self._system_message(f"muted: {name}")
+        else:
+            self._system_message(f"no node matching '{name}'")
+
+    def _cmd_unmute(self, arg: str) -> None:
+        name = (arg or "").strip()
+        if not name:
+            self._system_message("usage: /unmute <node name>")
+            return
+        if outreach.set_node_proactive(VAULT, name, True):
+            self._system_message(f"unmuted: {name}")
+        else:
+            self._system_message(f"no node matching '{name}'")
+
+    def _cmd_obsidian(self, arg: str) -> None:
+        ext = obsidian.resolve_vault_path(CONFIG)
+        if ext is None:
+            self._system_message("external vault is disabled (external_vault.path: null).")
+            return
+        sub = (arg or "").strip().lower()
+        if sub == "recent":
+            entries = obsidian.read_audit_tail(ext, n=10)
+            if not entries:
+                self._system_message("(no audit entries yet)")
+                return
+            lines = ["last audit entries:"]
+            for e in entries:
+                lines.append(f"  {e.get('ts','?')}  {e.get('tool','?')}  {e.get('result','')[:120]}")
+            self._system_message("\n".join(lines))
+            return
+        if sub == "diff":
+            import subprocess
+            try:
+                out = subprocess.run(
+                    ["git", "diff", "HEAD~5"],
+                    cwd=str(ext), capture_output=True, text=True, timeout=10,
+                )
+                text = (out.stdout or out.stderr or "(no diff)").strip()
+            except Exception as exc:
+                text = f"(git diff failed: {exc})"
+            self._system_message(text[:4000] or "(no diff)")
+            return
+        tail = obsidian.read_audit_tail(ext, n=1)
+        last = "-"
+        if tail:
+            e = tail[0]
+            last = f"{e.get('ts','?')} {e.get('tool','?')} — {e.get('result','')[:80]}"
+        head = obsidian.git_head(ext) or "(no git)"
+        self._system_message(
+            f"external vault: {ext}\n"
+            f"notes: {obsidian.note_count(ext)}\n"
+            f"head: {head}\n"
+            f"last audit: {last}"
+        )
 
     # ----- history + clipboard ----------------------------------------
 
@@ -683,47 +896,65 @@ class SamanthaTUI(App):
 
         alt_keys = (keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r)
         cmd_keys = (keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r)
+        # How long ⌘ must be held ALONE before we treat it as a vision-PTT
+        # intent (rather than the start of a Cmd+V / Cmd+Tab shortcut).
+        CMD_HOLD_SECONDS = 0.4
+
+        def _cmd_timer_fired():
+            # Timer thread. Start recording if the user is still pending
+            # (hasn't released and hasn't pressed another key).
+            if self._cmd_pending_since is None or self._cmd_cancelled:
+                return
+            if self._ptt_mode is not None:
+                return
+            self._cmd_pending_since = None
+            if self.video is None:
+                self.call_from_thread(
+                    self._system_message,
+                    "⌘ hold — vision disabled (cv2 missing or camera probe failed).",
+                )
+                return
+            if not self.voice or not self.voice.start_recording():
+                return
+            ok, reason = self.video.start_recording()
+            if ok:
+                self._ptt_mode = "vision"
+                self.call_from_thread(self._on_see_start)
+            else:
+                self._ptt_mode = "audio"
+                self.call_from_thread(self._on_listen_start)
+                self.call_from_thread(
+                    self._system_message, f"⌘ held — camera failed · {reason}"
+                )
 
         def on_press(key):
+            # Any non-⌘ key press while ⌘ is pending cancels the intent —
+            # this is what stops Cmd+V, Cmd+Tab, Cmd+Space from triggering
+            # the camera.
+            if self._cmd_pending_since is not None and key not in cmd_keys:
+                self._cmd_cancelled = True
+
             if self._ptt_mode is not None:
-                return  # a recording is already in progress; ignore other mods
+                return
             if key in alt_keys:
                 if self.voice and self.voice.start_recording():
                     self._ptt_mode = "audio"
                     self.call_from_thread(self._on_listen_start)
             elif key in cmd_keys:
-                # Always surface a message on Cmd press so the user can tell
-                # whether pynput even saw the key (vs. a silent failure).
-                if self.video is None:
-                    self.call_from_thread(
-                        self._system_message,
-                        "⌘ pressed — but vision mode is disabled (cv2 missing or camera probe failed at startup)."
-                    )
-                    return
-                if not self.voice:
-                    self.call_from_thread(
-                        self._system_message,
-                        "⌘ pressed — but voice backend is unavailable."
-                    )
-                    return
-                if not self.voice.start_recording():
-                    self.call_from_thread(
-                        self._system_message, "⌘ pressed — audio recorder refused to start."
-                    )
-                    return
-                ok, reason = self.video.start_recording()
-                if ok:
-                    self._ptt_mode = "vision"
-                    self.call_from_thread(self._on_see_start)
-                else:
-                    # Camera failed; fall back to audio-only for this press.
-                    self._ptt_mode = "audio"
-                    self.call_from_thread(self._on_listen_start)
-                    self.call_from_thread(
-                        self._system_message, f"⌘ pressed — camera failed · {reason}"
-                    )
+                # Arm the debounce timer. Actual recording only starts if
+                # ⌘ is still held alone after CMD_HOLD_SECONDS.
+                import threading as _th
+                self._cmd_pending_since = time.time()
+                self._cmd_cancelled = False
+                _th.Timer(CMD_HOLD_SECONDS, _cmd_timer_fired).start()
 
         def on_release(key):
+            if key in cmd_keys:
+                # Cancel any pending intent — user released before the
+                # debounce window elapsed (i.e. this was a quick tap or
+                # a shortcut, not a hold).
+                self._cmd_pending_since = None
+                self._cmd_cancelled = False
             if self._ptt_mode == "audio" and key in alt_keys:
                 self._ptt_mode = None
                 self.call_from_thread(self._on_listen_stop)
@@ -795,6 +1026,7 @@ class SamanthaTUI(App):
     # ----- chat pipeline ----------------------------------------------
 
     def _send(self, user_text: str, frames: list[str] | None = None) -> None:
+        self._chat_busy = True
         label = user_text
         if frames:
             label = f"{user_text}  📷 [{len(frames)} frame{'s' if len(frames) != 1 else ''}]"
@@ -805,10 +1037,20 @@ class SamanthaTUI(App):
     @work(thread=True)
     def _run_chat(self, user_text: str, frames: list[str] | None = None) -> None:
         if self.session is None:
+            task = user_text
+            if self._proactive_prefix:
+                task = f"reply to proactive: {self._proactive_prefix} — {user_text}"
             try:
                 self.session = session_mgr.start(
-                    task=user_text, tags=[], config=CONFIG, project_root=ROOT,
+                    task=task, tags=[], config=CONFIG, project_root=ROOT,
                 )
+                if self._proactive_node_path:
+                    existing = list(self.session.get("retrieved_files") or [])
+                    if self._proactive_node_path not in existing:
+                        existing.insert(0, self._proactive_node_path)
+                    self.session["retrieved_files"] = existing
+                self._proactive_prefix = None
+                self._proactive_node_path = None
                 if self.voice is not None:
                     self.session["system_prompt"] = (
                         self.session["system_prompt"] + PARALINGUISTIC_ADDENDUM
@@ -931,6 +1173,7 @@ class SamanthaTUI(App):
             self._current_ai.update_content(content)
             self._current_ai = None
         self._last_reply = content
+        self._chat_busy = False
         self._chat_container.scroll_end(animate=False)
 
     def _set_status(self, text: str) -> None:

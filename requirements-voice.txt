@@ -20,3 +20,14 @@ pynput>=1.7.6
 # Camera capture for "hold ⌘ to see" multimodal mode (optional — the TUI
 # falls back to audio-only if cv2 is missing). Uses AVFoundation on macOS.
 opencv-python>=4.9.0
+
+# Voice Activity Detection for hands-free listening (`/listen on`).
+# ~1MB ONNX model, runs on CPU in microseconds per frame.
+silero-vad>=5.0.0
+
+# Free web search (DuckDuckGo) used by the `web_search` tool. No API key.
+ddgs>=9.0.0
+
+# Cron expression parsing for scheduled reminders (`schedule_reminder`
+# tool). Small, pure-Python.
+croniter>=2.0.0
