@@ -41,6 +41,12 @@ models:
   deep:
     provider: mistral
     model: magistral-medium-latest
+  # Vision — used by samantha's "hold ⌘ to see" mode. Takes image parts
+  # alongside the transcribed audio. Falls back to model1 if this key is
+  # missing. Pixtral is Mistral's multimodal workhorse.
+  vision:
+    provider: mistral
+    model: pixtral-large-latest
 
 retrieval:
   entry_points: 8
@@ -57,7 +63,11 @@ retrieval:
     recency: 0.10
 
 decay:
-  lambda: 0.05
+  # λ=0.02 → ~35-day half-life. Softer than the old λ=0.05 (~14 days) so
+  # rare-but-important facts (a birthday, a once-mentioned preference) don't
+  # archive just because a month of silence passed. Pair with `pin: true`
+  # in frontmatter for facts that must NEVER decay.
+  lambda: 0.02
   archive_threshold: 0.10
 
 monitor:

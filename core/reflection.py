@@ -156,6 +156,60 @@ MODEL1_TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_list",
+            "description": (
+                "Cheap metadata-only enumeration of my vault: returns a list "
+                "of {name, type, tags, importance} dicts — NO bodies, NO token "
+                "cost per node. Use BEFORE memory_summarize to pick which "
+                "nodes to distill. Great for questions like 'all concepts I "
+                "hold about meditation' or 'every entity tagged family'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tag": {"type": "string",
+                            "description": "Filter by tag (case-insensitive)."},
+                    "type": {"type": "string",
+                             "description": "entity|concept|decision|episode|tension|question|procedure"},
+                    "limit": {"type": "integer",
+                              "description": "Max results (default 100)."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_summarize",
+            "description": (
+                "Recursive distillation: feed N node names plus a focus "
+                "question, get back a single paragraph synthesized by a "
+                "sub-call. Use when many nodes are relevant but their full "
+                "bodies would blow up my context. Pair with memory_list to "
+                "first collect the candidate set, then collapse it here. "
+                "This is how I stay coherent on vault-scale queries."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Node names to summarize (from memory_list).",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "What the summary should focus on.",
+                    },
+                },
+                "required": ["names", "query"],
+            },
+        },
+    },
 ]
 
 ALLOWED_FOLDERS = {
@@ -350,15 +404,20 @@ def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     extraction) — the empty reply then poisons subsequent turns with 400s.
 
     Drop those empty assistant messages defensively at the API boundary.
+    Handles string content *and* multimodal list content (text+image parts).
     """
     out = []
     for m in messages:
-        if (
-            m.get("role") == "assistant"
-            and not (m.get("content") or "").strip()
-            and not m.get("tool_calls")
-        ):
-            continue
+        if m.get("role") == "assistant":
+            raw = m.get("content")
+            if raw is None:
+                is_empty = True
+            elif isinstance(raw, list):
+                is_empty = not raw
+            else:
+                is_empty = not str(raw).strip()
+            if is_empty and not m.get("tool_calls"):
+                continue
         out.append(m)
     return out
 
@@ -479,6 +538,66 @@ def _model1_tool_dispatch(
             args.get("end_date") or None,
         )
         return "\n".join(names) if names else "(no transcripts in range)"
+
+    if name == "memory_list":
+        from utils import indexer as _idx
+        tag = (args.get("tag") or "").lower().strip() or None
+        ntype = (args.get("type") or "").strip() or None
+        limit = int(args.get("limit") or 100)
+        idx = _idx.build(vault)
+        rows: list[str] = []
+        for nm, meta in idx.items():
+            if ntype and meta.get("type") != ntype:
+                continue
+            tags = [str(t).lower() for t in (meta.get("tags") or [])]
+            if tag and tag not in tags:
+                continue
+            imp = meta.get("importance", "?")
+            tag_str = ",".join(tags) if tags else "-"
+            rows.append(
+                f"  {nm}  (type={meta.get('type', '?')}, tags={tag_str}, importance={imp})"
+            )
+            if len(rows) >= limit:
+                break
+        if not rows:
+            return "(no matching nodes)"
+        return f"{len(rows)} node(s):\n" + "\n".join(rows)
+
+    if name == "memory_summarize":
+        names = args.get("names") or []
+        if not isinstance(names, list):
+            return "(memory_summarize: 'names' must be a list)"
+        query = str(args.get("query", "")).strip()
+        if not names:
+            return "(memory_summarize: no names provided)"
+        # Gather bodies. Cap each to keep the sub-call focused.
+        blocks: list[str] = []
+        for raw in names[:30]:
+            body = vault_tools.read_node(vault, str(raw))
+            blocks.append(f"=== {raw} ===\n{body[:3000]}")
+        joined = "\n\n".join(blocks)
+        sub_system = (
+            "You are a focused summarizer. The user will give you a set of "
+            "vault nodes and a query. Produce ONE tight paragraph (≤ 180 "
+            "words) answering the query using ONLY those nodes. If the "
+            "nodes don't contain the answer, say so in one sentence. Do "
+            "not invent facts. Do not reference node names unless asked."
+        )
+        sub_user = (
+            f"Query: {query}\n\n"
+            f"Nodes ({len(blocks)}):\n\n{joined[:24000]}"
+        )
+        try:
+            summary = chat(
+                role="model1",
+                system=sub_system,
+                messages=[{"role": "user", "content": sub_user}],
+                config=config,
+                max_tokens=512,
+            )
+        except Exception as exc:
+            return f"(summarize failed: {exc})"
+        return summary.strip() or "(sub-call returned nothing)"
 
     return f"unknown tool: {name}"
 

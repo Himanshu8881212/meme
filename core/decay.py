@@ -56,6 +56,17 @@ def run(vault_path: str | Path, lambda_: float, archive_threshold: float) -> dic
         if fm.get("type") in ("transcript", "identity") or fm.get("immutable"):
             continue
 
+        # Pinned nodes skip decay entirely — for birthdays, formative
+        # incidents, or any rare-but-critical fact that would otherwise be
+        # archived by a 35-day half-life if not re-accessed. Their retrieval
+        # weight stays at their importance (no recency penalty).
+        if fm.get("pin"):
+            fm["decay_weight"] = float(fm.get("importance", 1.0))
+            fm["archived"] = False
+            frontmatter.write(path, fm, body)
+            processed += 1
+            continue
+
         name = path.stem
         connections = backlinks.get(name, int(fm.get("connection_count", 0)))
         last = _to_date(fm.get("last_accessed") or fm.get("created"), today)
