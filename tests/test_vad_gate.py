@@ -60,7 +60,7 @@ def test_gate_extends_cooldown_while_playing(voice):
     voice._tts_cooldown_until = 0.0
     voice._tts_gate()
     c1 = voice._tts_cooldown_until
-    assert c1 > time.time() + 2.0  # pushed ≥2.5s out
+    assert c1 > time.time() + 2.5  # pushed ≥3s out (padded for OS buffer)
     # Advance time a tiny bit — a second check should re-extend.
     time.sleep(0.05)
     voice._tts_gate()

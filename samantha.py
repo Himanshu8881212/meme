@@ -331,7 +331,7 @@ class VoiceBackend:
             pass
         if playing:
             self._tts_cooldown_until = max(
-                self._tts_cooldown_until, time.time() + 2.5,
+                self._tts_cooldown_until, time.time() + 3.0,
             )
             return True
         if self._tts_busy.is_set():
@@ -361,35 +361,69 @@ class VoiceBackend:
         }
 
     def _vad_worker(self) -> None:
-        """Drain VAD frames, detect utterances, transcribe each on end-of-speech."""
-        # silero-vad needs exactly 512 samples at 16 kHz per call. Our
-        # audio callback ships CHUNK_SIZE (=512) — one-to-one.
+        """Drain VAD frames, detect utterances, transcribe each on end-of-speech.
+
+        Three defences against the echo loop:
+          (a) Audio callback already drops frames while gate is closed;
+              so the queue only carries "real" frames.
+          (b) On every gate→open transition we reset silero's internal
+              state AND discard any frames that snuck in during the race.
+          (c) RMS gate: if the utterance's average energy is below
+              `min_user_rms`, assume residual room echo and drop it —
+              real user speech is 3-10× louder than typical echo tail.
+        """
+        import numpy as _np
         speech_buf: list = []
         in_speech = False
+        gate_was_closed = True
+        min_user_rms = 0.015  # empirical floor — below = echo/background
+        min_utterance_confidence_rms = 0.020
+
+        def _reset_vad():
+            if hasattr(self._vad_iter, "reset_states"):
+                try: self._vad_iter.reset_states()
+                except Exception: pass
+
         while self.listen_mode:
+            if self._tts_gate():
+                if not gate_was_closed:
+                    gate_was_closed = True
+                    speech_buf.clear()
+                    in_speech = False
+                    _reset_vad()
+                time.sleep(0.03)
+                continue
+
+            # Gate is open — flush any frames that raced in from the callback
+            # right at the transition before we can trust them.
+            if gate_was_closed:
+                gate_was_closed = False
+                drained = 0
+                while not self._vad_frames.empty() and drained < 64:
+                    try: self._vad_frames.get_nowait()
+                    except queue.Empty: break
+                    drained += 1
+                _reset_vad()
+                speech_buf.clear()
+                in_speech = False
+                continue
+
             try:
                 frame = self._vad_frames.get(timeout=0.1)
             except queue.Empty:
                 continue
 
-            # Gate while (and briefly after) Samantha is speaking. Drop any
-            # partial utterance — the mic was hearing TTS echo, not the user.
-            if self._tts_gate():
-                speech_buf.clear()
-                in_speech = False
-                if hasattr(self._vad_iter, "reset_states"):
-                    try: self._vad_iter.reset_states()
-                    except Exception: pass
+            if len(frame) != 512:
                 continue
 
-            # silero-vad accepts 1-D float32 arrays of length 512.
-            if len(frame) != 512:
-                # Skip oddly-sized frames rather than error out.
-                continue
+            # RMS check — kill any frame whose energy is below the noise floor
+            # BEFORE feeding silero. Even if VAD would've fired on room-
+            # shaped residual, we catch it here.
+            rms = float(_np.sqrt(_np.mean(frame.astype(_np.float32) ** 2)))
+
             try:
-                # torch is available because silero-vad depends on it.
                 import torch
-                tensor = torch.from_numpy(frame.astype(np.float32))
+                tensor = torch.from_numpy(frame.astype(_np.float32))
                 result = self._vad_iter(tensor)
             except Exception:
                 result = None
@@ -399,32 +433,42 @@ class VoiceBackend:
 
             if result:
                 if "start" in result and not in_speech:
+                    # Extra skepticism on utterance starts — a quiet start
+                    # is almost always echo. Real speech starts louder.
+                    if rms < min_user_rms:
+                        continue
                     in_speech = True
-                    # Include the frame that triggered the start so we don't
-                    # clip the first phoneme.
                     speech_buf.append(frame)
                 elif "end" in result and in_speech:
                     in_speech = False
-                    audio = np.concatenate(speech_buf).flatten().astype(np.float32)
+                    audio = _np.concatenate(speech_buf).flatten().astype(_np.float32)
                     speech_buf = []
-                    if len(audio) >= SAMPLE_RATE * 0.3:
+                    if len(audio) < SAMPLE_RATE * 0.3:
+                        continue
+                    # Whole-utterance RMS gate — a too-quiet utterance is
+                    # echo tail, not a real user turn.
+                    utt_rms = float(_np.sqrt(_np.mean(audio ** 2)))
+                    if utt_rms < min_utterance_confidence_rms:
+                        continue
+                    try:
+                        text = self._transcribe(audio)
+                    except Exception:
+                        text = ""
+                    if text and self._on_speech:
                         try:
-                            text = self._transcribe(audio)
+                            self._on_speech(text)
                         except Exception:
-                            text = ""
-                        if text and self._on_speech:
-                            try:
-                                self._on_speech(text)
-                            except Exception:
-                                pass
+                            pass
 
     def _audio_cb(self, indata, frames, time_info, status):
         with self.lock:
             if self.is_recording:
                 self.audio_chunks.append(indata.copy())
-        # Listen mode — ship every frame to the VAD worker. Drop on overflow
-        # rather than block the audio thread; a dropped 32ms frame is fine.
-        if self.listen_mode:
+        # Listen mode — ONLY buffer frames when the gate is open. If we
+        # queue echo frames while Samantha is talking and drain them later,
+        # VAD detects "speech" right after she finishes and loops. This is
+        # the hands-free echo-loop bug in one line.
+        if self.listen_mode and not self._tts_gate():
             try:
                 self._vad_frames.put_nowait(indata.copy().flatten())
             except queue.Full:
@@ -528,10 +572,12 @@ class VoiceBackend:
                 sys.stderr.close()
                 sys.stderr = _prev
                 self._tts_busy.clear()
-                # Post-generation cooldown — `buffered_samples > 0` handles
-                # the tail too, but this adds a margin for speaker latency
-                # + room reflections that the player can't see.
-                self._tts_cooldown_until = time.time() + 2.0
+                # Post-generation cooldown — `buffered_samples` doesn't
+                # see the OS + hardware audio buffer (~150ms on macOS),
+                # so we pad beyond what the player reports. 3s is
+                # conservative but eliminates the "tail leaks as user
+                # speech" class of bug in practice.
+                self._tts_cooldown_until = time.time() + 3.0
 
 
 class VideoBackend:

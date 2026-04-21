@@ -35,13 +35,13 @@ providers:
 models:
   model1:
     provider: mistral
-    model: magistral-small-latest
+    model: magistral-medium-latest
   routine:
     provider: mistral
-    model: magistral-small-latest
+    model: magistral-medium-latest
   deep:
     provider: mistral
-    model: magistral-small-latest
+    model: magistral-medium-latest
 
 retrieval:
   entry_points: 8
