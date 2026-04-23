@@ -302,7 +302,10 @@ UTILITY_TOOL_SCHEMAS = [
                 "Schedule a proactive reminder. After `seconds` pass, Samantha "
                 "will post a system line AND speak the message aloud. Use for "
                 "'remind me in 10 minutes to X', 'set a 5 minute timer', "
-                "'wake me in an hour'."
+                "'wake me in an hour'. The timer is PERSISTED — it shows up "
+                "in `list_reminders` and is cancellable via `cancel_reminder` "
+                "by its id. Pass the returned id along to the user if they "
+                "might want to cancel."
             ),
             "parameters": {
                 "type": "object",
@@ -358,7 +361,12 @@ UTILITY_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "cancel_reminder",
-            "description": "Remove a scheduled reminder by its id.",
+            "description": (
+                "Remove a scheduled reminder (or a timer set via `set_timer`) "
+                "by its id. If the user asks to cancel but you don't have the "
+                "id, call `list_reminders` first to find it — match on the "
+                "message text the user references."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}},
@@ -630,6 +638,26 @@ THINK_BLOCK = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# Magistral sometimes echoes tool invocations as literal text in its
+# content stream (e.g. `obsidian_list{"folder": "Drafts"}`) instead of
+# firing them through the tool-call channel. These leaks bypass the
+# tool-dispatch pipeline and spray raw invocation syntax into the
+# user-visible reply. Strip them before anything sees the text.
+# Pattern matches: word chars + `{` + any chars up to the matching `}`.
+# We keep this conservative (requires `{` immediately after name) so
+# ordinary prose like `set_timer(5)` or `obsidian_list in the UI`
+# isn't affected.
+_TOOL_CALL_LEAK = re.compile(
+    r"\b[a-z][a-z0-9_]{2,}\s*\{[^{}\n]{0,500}\}",
+    re.IGNORECASE,
+)
+
+
+def strip_tool_call_leaks(text: str) -> str:
+    if not text:
+        return text
+    return _TOOL_CALL_LEAK.sub("", text)
+
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 # Global override. Set MEMORY_BACKEND=echo to force the offline backend on
@@ -648,7 +676,9 @@ def _format_context(vault_files: list[tuple[str, str]]) -> str:
 
 
 def strip_thinking(text: str) -> str:
-    return THINK_BLOCK.sub("", text).strip()
+    cleaned = THINK_BLOCK.sub("", text)
+    cleaned = strip_tool_call_leaks(cleaned)
+    return cleaned.strip()
 
 
 def _extract_text_only(content: Any) -> str:
@@ -1122,7 +1152,12 @@ def _model1_tool_dispatch(
         return now.strftime("%A, %B %d %Y — %I:%M %p ") + tz
 
     if name == "set_timer":
-        from core import runtime as _rt
+        # Route relative timers through the same persistent cron store so
+        # they show up in list_reminders and are cancellable by id. Before
+        # this, set_timer used a bare threading.Timer with no handle —
+        # once fired-and-forget, there was no way to cancel.
+        from core import cron as _cron
+        from datetime import datetime as _dt, timedelta as _td
         try:
             seconds = int(args.get("seconds", 0))
         except (TypeError, ValueError):
@@ -1130,22 +1165,16 @@ def _model1_tool_dispatch(
         message = str(args.get("message") or "timer done")
         if seconds <= 0:
             return "(timer needs a positive number of seconds)"
-
-        def _fire():
-            voice = _rt.get("voice")
-            app = _rt.get("app")
-            text = f"⏰ timer: {message}"
-            if app is not None:
-                try:
-                    app.call_from_thread(app._sys, text)
-                except Exception:
-                    pass
-            if voice is not None and not voice.muted:
-                voice.speak(message)
-        import threading as _th
-        _th.Timer(float(seconds), _fire).start()
+        fire_at = (_dt.now().astimezone() + _td(seconds=seconds)).isoformat(timespec="seconds")
+        r = _cron.add(vault, message, once_at=fire_at)
+        if not r.get("ok"):
+            return f"error: {r.get('error')}"
+        e = r["entry"]
         mins, rem = divmod(seconds, 60)
-        return f"timer set — in {mins}m {rem}s I'll remind you: {message!r}"
+        return (
+            f"timer set (id {e['id']}) — in {mins}m {rem}s I'll remind you: "
+            f"{message!r}. Cancel with cancel_reminder(id='{e['id']}')."
+        )
 
     if name == "schedule_reminder":
         from core import cron as _cron
@@ -1284,6 +1313,13 @@ def chat_with_tools(
                 result = _model1_tool_dispatch(vault, tc.function.name, args, config)
             except Exception as exc:
                 result = f"tool error: {exc}"
+            # Record outcome to persistent tool-use log so the next turn's
+            # system prompt can show the model what worked / didn't.
+            try:
+                from core import tool_memory as _tm
+                _tm.log_call(vault, tc.function.name, args, str(result))
+            except Exception:
+                pass
             call_log.append({
                 "tool": tc.function.name, "args": args,
                 "result_chars": len(str(result)),
@@ -1305,6 +1341,202 @@ def chat_with_tools(
         }],
     )
     return strip_thinking(_normalize_content(resp.choices[0].message.content)), call_log
+
+
+def chat_with_tools_stream(
+    role: str,
+    system: str,
+    messages: list[dict[str, str]],
+    config: dict[str, Any],
+    vault_path: str | Path,
+    max_tokens: int = 2048,
+    max_rounds: int | None = None,
+):
+    """Streaming variant of chat_with_tools. Yields events:
+
+      ("tool_call",   {"name": ..., "args": {...}, "result_chars": N})
+      ("content",     "<partial text chunk>")
+      ("final",       "<full final reply>")     — emitted once at the end
+
+    Each API call is made with stream=True. We accumulate tool_call deltas
+    until the round ends, then execute them; content deltas are forwarded
+    to the caller immediately. On the non-tool-call round (the final
+    answer), content tokens stream live — this is what gives the user
+    "tokens appearing as she thinks" UX in agentic mode.
+    """
+    provider_name, provider, model = _resolve(role, config)
+    if provider_name == "echo":
+        reply, log = chat_with_tools(
+            role=role, system=system, messages=messages,
+            config=config, vault_path=vault_path, max_tokens=max_tokens,
+            max_rounds=max_rounds,
+        )
+        for entry in log:
+            yield ("tool_call", entry)
+        yield ("content", reply)
+        yield ("final", reply)
+        return
+
+    if max_rounds is None:
+        max_rounds = int(
+            (config.get("session") or {}).get("max_tool_rounds", 5)
+        )
+    vault = Path(vault_path)
+    client = _get_client(provider_name, provider)
+    retries, backoff = _retry_params(config)
+    msgs: list[dict[str, Any]] = [
+        {"role": "system", "content": system},
+        *messages,
+    ]
+    schemas = model1_tool_schemas(config)
+
+    final_text_accum: list[str] = []
+
+    for _round in range(max_rounds):
+        # Accumulators for this round. Tool-call deltas arrive as
+        # fragments indexed by tool-call index.
+        content_buf: list[str] = []
+        tool_call_bufs: dict[int, dict[str, Any]] = {}
+        # Attempt loop for rate-limit retries.
+        last_exc: Exception | None = None
+        stream = None
+        for attempt in range(retries):
+            try:
+                stream = client.chat.completions.create(
+                    model=model, max_tokens=max_tokens,
+                    messages=msgs, tools=schemas, tool_choice="auto",
+                    stream=True,
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                if not _is_rate_limited(exc) or attempt == retries - 1:
+                    raise
+                time.sleep(backoff * (2 ** attempt))
+        if stream is None:
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError("chat stream failed to initialize")
+
+        for event in stream:
+            if not event.choices:
+                continue
+            delta = event.choices[0].delta
+            # Text content delta.
+            dc = getattr(delta, "content", None)
+            if dc:
+                text = _extract_text_only(dc)
+                if text:
+                    content_buf.append(text)
+                    # Defer emitting content until we know this round
+                    # WASN'T a tool-call round — see end-of-stream block.
+            # Tool-call deltas — arrive piecemeal.
+            tcs = getattr(delta, "tool_calls", None) or []
+            for tc in tcs:
+                idx = getattr(tc, "index", 0) or 0
+                buf = tool_call_bufs.setdefault(
+                    idx, {"id": None, "name": None, "arguments": ""},
+                )
+                if getattr(tc, "id", None):
+                    buf["id"] = tc.id
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        buf["name"] = fn.name
+                    if getattr(fn, "arguments", None):
+                        buf["arguments"] += fn.arguments
+
+        # Filter out hallucinated tool calls — Magistral occasionally
+        # emits tool_call deltas whose "name" is a flag wrapped in
+        # markdown (`[NOVEL: ...](#)` etc.). Those land in our dispatch
+        # as garbage and clutter the UI. Keep only names we actually
+        # expose in the schema.
+        valid_names = {t["function"]["name"] for t in schemas}
+        tool_call_bufs = {
+            idx: buf for idx, buf in tool_call_bufs.items()
+            if (buf.get("name") or "") in valid_names
+        }
+
+        if not tool_call_bufs:
+            # This was the final round — stream the content now.
+            full = "".join(content_buf)
+            cleaned = strip_thinking(_normalize_content(full))
+            final_text_accum.append(cleaned)
+            if cleaned:
+                yield ("content", cleaned)
+            yield ("final", cleaned)
+            return
+
+        # Tool-call round — dispatch and continue looping.
+        replay_content = strip_thinking(_normalize_content("".join(content_buf)))
+        msgs.append({
+            "role": "assistant",
+            "content": replay_content,
+            "tool_calls": [
+                {
+                    "id": buf["id"] or f"call_{idx}",
+                    "type": "function",
+                    "function": {
+                        "name": buf["name"] or "",
+                        "arguments": buf["arguments"] or "{}",
+                    },
+                }
+                for idx, buf in sorted(tool_call_bufs.items())
+            ],
+        })
+
+        # Dispatch all tool calls in this round in parallel — when the
+        # model calls e.g. memory_list + memory_search together, running
+        # them sequentially doubles the latency. Each tool is pure I/O
+        # or a model sub-call, so threads are fine.
+        from concurrent.futures import ThreadPoolExecutor
+        ordered = sorted(tool_call_bufs.items())
+
+        def _run_one(idx_buf):
+            idx, buf = idx_buf
+            name = buf["name"] or ""
+            try:
+                args = json.loads(buf["arguments"] or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            try:
+                result = _model1_tool_dispatch(vault, name, args, config)
+            except Exception as exc:
+                result = f"tool error: {exc}"
+            try:
+                from core import tool_memory as _tm
+                _tm.log_call(vault, name, args, str(result))
+            except Exception:
+                pass
+            return idx, buf, name, args, result
+
+        max_workers = min(len(ordered), 6) or 1
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            results = list(ex.map(_run_one, ordered))
+        # Preserve original call order for the yielded events + appended msgs.
+        for idx, buf, name, args, result in results:
+            yield ("tool_call", {
+                "name": name, "args": args,
+                "result_chars": len(str(result)),
+            })
+            msgs.append({
+                "role": "tool",
+                "tool_call_id": buf["id"] or f"call_{idx}",
+                "content": str(result)[:8000],
+            })
+
+    # Exhausted rounds — one more shot, non-streaming, asking for an answer.
+    resp = _create_with_retry(
+        client, max_retries=retries, backoff_base_sec=backoff,
+        model=model, max_tokens=max_tokens,
+        messages=msgs + [{
+            "role": "user",
+            "content": "Max tool rounds reached. Answer now with what you have.",
+        }],
+    )
+    fallback = strip_thinking(_normalize_content(resp.choices[0].message.content))
+    yield ("content", fallback)
+    yield ("final", fallback)
 
 
 def routine(flag_summary: str, vault_files: list[tuple[str, str]],
@@ -1595,6 +1827,29 @@ def reconcile_tensions(vault_path: str | Path) -> list[dict[str, str]]:
     return results
 
 
+_PLACEHOLDER_PATTERNS = re.compile(
+    r"<\s*(?:preserve existing body|preserve existing|increment existing|"
+    r"existing body preserved|existing frontmatter preserved|"
+    r"remainder of existing body preserved|incremented)\s*>|"
+    r"\.\.\. *existing body preserved *\.\.\.",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_placeholder_overwrite(content: str) -> bool:
+    """True if the content is dominated by template placeholder tokens
+    with little real prose. We allow a few placeholders for safety (they
+    sometimes appear in frontmatter), but if the real-prose content is
+    smaller than the placeholder bulk, this is a broken write."""
+    hits = _PLACEHOLDER_PATTERNS.findall(content)
+    if not hits:
+        return False
+    stripped = _PLACEHOLDER_PATTERNS.sub("", content)
+    # Drop whitespace and markdown chrome so we measure real content.
+    bare = re.sub(r"[\s#*\-\[\]]+", "", stripped)
+    return len(bare) < 80
+
+
 def apply_writes(
     model_output: str,
     vault_path: str | Path,
@@ -1646,6 +1901,21 @@ def apply_writes(
             applied.append({"path": rel_path, "action": "deleted"})
             continue
 
+        # Guard against the "placeholder overwrite" failure mode. The
+        # reflection prompt's examples use tokens like
+        # `<preserve existing body>`, `... existing body preserved ...`,
+        # `<existing frontmatter preserved>`, `<increment existing>`.
+        # If the model emits those verbatim instead of the real final
+        # content, writing them to disk nukes the prior file. Reject
+        # these so the target keeps its last good state. Also applies
+        # to `<increment existing>` frontmatter placeholders.
+        if _looks_like_placeholder_overwrite(content):
+            applied.append({
+                "path": rel_path, "action": "rejected",
+                "reason": "content is mostly placeholders (e.g. <preserve existing body>)",
+            })
+            continue
+
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content.rstrip() + "\n", encoding="utf-8")
 
@@ -1673,10 +1943,23 @@ def apply_writes(
     # an embeddings-less install still works.
     if applied and any(a.get("action") in ("create", "update", "reconciled", "deleted")
                        for a in applied):
+        # Invalidate the indexer cache — writes just happened, the next
+        # retrieval must see them. Without this, cached metadata would
+        # lag by one turn.
+        try:
+            from utils import indexer as _idx
+            _idx.invalidate(vault)
+        except Exception:
+            pass
         try:
             from core import embeddings as _emb
             if _emb.is_available():
                 _emb.build_index(vault)
+        except Exception:
+            pass
+        try:
+            from core import mood as _mood
+            _mood.update_mood(vault)
         except Exception:
             pass
 

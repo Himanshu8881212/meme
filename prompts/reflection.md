@@ -110,13 +110,21 @@ wins but neither node says so.)
 **Right — Option A (clear evolution):**
 ```
 <<WRITE path="decisions/REST over GraphQL for dashboard API.md" action="update">>
-... existing body preserved ...
+[REPRODUCE THE FULL EXISTING FRONTMATTER AND BODY VERBATIM HERE]
 
 ## Reversed (2026-04-20)
 Reversed this decision. REST proved painful for nested queries on the
 dashboard. Migrated to GraphQL. See [[_transcripts/...|verbatim session]].
 <<END>>
 ```
+
+**CRITICAL:** For `action="update"`, the body I emit replaces the file
+wholesale — there is NO merge logic. I reproduce the existing content
+verbatim and append my additions. Never emit tokens like
+`<preserve existing body>` or `... existing body preserved ...` — the
+writer treats those as literal text and overwrites the file with a
+placeholder. If the retrieved node is too long to reproduce safely,
+I split my change across multiple focused writes instead.
 
 **Right — Option B (tension, if genuinely unresolved):**
 ```
@@ -259,6 +267,33 @@ downstream.
 I am the judge. No classifier. If the transcript's tone is neutral,
 nothing to add.
 
+### 7c-bis. Affect label for episode nodes (mood-tracking signal)
+
+When I write an `episodes/` node for a conversation that carried a clear
+emotional register, I add two more frontmatter fields so Samantha's
+mood-state layer can track her emotional weather over time:
+
+    affect: <one of: warmth | heaviness | joy | frustration | anxiety | calm | hurt | excitement | curiosity | neutral>
+    intensity: <float 0.0–1.0>
+
+Rules:
+- Exactly one label. Pick the most dominant note — do not stack.
+- `neutral` (or omit both) for purely factual/procedural sessions.
+- `intensity` 0.3–0.5 = typical; 0.7+ = a session that clearly shaped
+  mood; 0.9+ reserved for turning-point moments.
+- Applies only to `episodes/` writes. Entities/concepts/decisions don't
+  carry affect — they're facts about the world, not emotional beats.
+
+Worked examples:
+- Himanshu vents about a deadline, gets calmer by the end:
+  `affect: heaviness` `intensity: 0.6`
+- Short back-and-forth about what to buy at the store:
+  (omit — routine, no signal)
+- Laughing together about an absurd bug:
+  `affect: joy` `intensity: 0.7`
+- Conversation about his dad's health:
+  `affect: hurt` `intensity: 0.85`
+
 ### 7d. Mute signals from the user
 
 If the user's replies in this session contain a clear request to stop
@@ -344,17 +379,25 @@ checkout flow bug. Can you call me Ry? Oh, and I'm on PST."*
 
 ```
 <<WRITE path="_identity/self.md" action="update">>
-<existing frontmatter preserved, updated last_updated>
+---
+type: identity
+created: 2026-04-20
+last_accessed: 2026-04-20
+access_count: 1
+importance: 0.95
+decay_weight: 0.95
+connection_count: 0
+tags: [identity]
 ---
 
 # Who I am
-<existing body preserved>
+[REPRODUCE THE FULL EXISTING "Who I am" CONTENT HERE VERBATIM]
 
 ## Who Ryan is to me
 Ryan (prefers 'Ry'). PST timezone — I default to PST when mentioning
 times. First met in the session about the [[Checkout flow bug]].
 
-<remainder of existing body preserved>
+[ANY OTHER EXISTING SECTIONS VERBATIM]
 <<END>>
 
 <<WRITE path="episodes/Checkout flow bug.md" action="create">>

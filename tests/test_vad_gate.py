@@ -34,6 +34,12 @@ def voice():
     backend.player.buffered_samples = 0
     backend.listen_mode = False
     backend.muted = False
+    backend._vad_stats = {
+        "frames_in": 0, "frames_gated": 0, "frames_processed": 0,
+        "max_rms_seen": 0.0, "speech_starts": 0,
+        "utterances_emitted": 0, "utterances_dropped_rms": 0,
+        "utterances_dropped_short": 0,
+    }
     return backend
 
 

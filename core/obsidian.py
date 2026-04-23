@@ -44,7 +44,13 @@ def _safe_target(vault: Path, rel_path: str) -> Path | None:
 
 
 def _ensure_md(rel_path: str) -> str:
-    return rel_path if rel_path.endswith(".md") else rel_path + ".md"
+    """Normalise to a `.md` path and reject empty/invalid names.
+    Empty rel_path would otherwise produce a literal `.md` file with
+    no stem — we've already seen this create an orphan in the vault."""
+    rel = (rel_path or "").strip()
+    if not rel or rel.replace(".md", "").strip() == "":
+        raise ValueError(f"empty or invalid rel_path: {rel_path!r}")
+    return rel if rel.endswith(".md") else rel + ".md"
 
 
 # ---------- audit + git ----------------------------------------------------

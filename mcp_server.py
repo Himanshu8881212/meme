@@ -194,5 +194,180 @@ def memory_list_tags() -> str:
     return ", ".join(sorted(tags))
 
 
+# ── RLM-lite: aggregate enumeration + recursive summarization ─────────────
+
+@mcp.tool()
+def memory_list(tag: str | None = None, type: str | None = None, limit: int = 100) -> str:
+    """Metadata-only enumeration of vault nodes — for 'all of X' / 'everything
+    about Y' queries. Returns name + type + tags + importance per node, no
+    bodies. Pair with `memory_summarize` for vault-scale answers."""
+    from core.reflection import _model1_tool_dispatch
+    args = {"limit": limit}
+    if tag: args["tag"] = tag
+    if type: args["type"] = type
+    return _model1_tool_dispatch(VAULT, "memory_list", args, CONFIG)
+
+
+@mcp.tool()
+def memory_summarize(names: list[str], query: str) -> str:
+    """Recursive distillation — feed up to 30 node names + a focus question;
+    a sub-LM reads each node and returns one tight paragraph."""
+    from core.reflection import _model1_tool_dispatch
+    return _model1_tool_dispatch(
+        VAULT, "memory_summarize",
+        {"names": names, "query": query}, CONFIG,
+    )
+
+
+# ── Obsidian (user's external notebook) — only active if configured ──────
+
+def _ext_ok() -> bool:
+    from core import obsidian as _ob
+    return _ob.resolve_vault_path(CONFIG) is not None
+
+
+@mcp.tool()
+def obsidian_create(rel_path: str, body: str, frontmatter: dict | None = None) -> str:
+    """Create a new note in the user's external Obsidian vault. Writes to
+    THEIR notebook, not the memory vault. Search/list first to avoid
+    duplicates."""
+    if not _ext_ok():
+        return "(external Obsidian vault not configured)"
+    from core import obsidian as _ob
+    r = _ob.create_note(
+        _ob.resolve_vault_path(CONFIG), rel_path, body,
+        frontmatter=frontmatter, config=CONFIG,
+    )
+    return r.get("preview") if r.get("ok") else f"error: {r.get('error')}"
+
+
+@mcp.tool()
+def obsidian_update(rel_path: str, body: str, mode: str = "replace") -> str:
+    """Edit an existing note in the user's Obsidian vault.
+    mode: 'replace' | 'append' | 'prepend'."""
+    if not _ext_ok():
+        return "(external Obsidian vault not configured)"
+    from core import obsidian as _ob
+    r = _ob.update_note(
+        _ob.resolve_vault_path(CONFIG), rel_path, body,
+        mode=mode, config=CONFIG,
+    )
+    return r.get("preview") if r.get("ok") else f"error: {r.get('error')}"
+
+
+@mcp.tool()
+def obsidian_read(rel_path: str) -> str:
+    """Read a note from the user's Obsidian vault."""
+    if not _ext_ok():
+        return "(external Obsidian vault not configured)"
+    from core import obsidian as _ob
+    return _ob.read_note(_ob.resolve_vault_path(CONFIG), rel_path)
+
+
+@mcp.tool()
+def obsidian_search(query: str, limit: int = 10) -> str:
+    """Phrase search across the user's Obsidian vault. Returns path, line,
+    snippet per hit. Extract the core concept word from the user's question
+    before searching — don't search the whole question verbatim."""
+    if not _ext_ok():
+        return "(external Obsidian vault not configured)"
+    from core import obsidian as _ob
+    hits = _ob.search_notes(_ob.resolve_vault_path(CONFIG), query, limit=limit)
+    if not hits:
+        return "(no matches)"
+    return "\n".join(f"{h['path']}:{h['line_no']}: {h['snippet']}" for h in hits)
+
+
+@mcp.tool()
+def obsidian_list(folder: str | None = None, limit: int = 50) -> str:
+    """List notes in the user's Obsidian vault — all of them, or one folder."""
+    if not _ext_ok():
+        return "(external Obsidian vault not configured)"
+    from core import obsidian as _ob
+    names = _ob.list_notes(_ob.resolve_vault_path(CONFIG), folder, limit=limit)
+    return "\n".join(names) if names else "(empty)"
+
+
+@mcp.tool()
+def obsidian_link(rel_path: str, target: str, label: str | None = None) -> str:
+    """Append a [[wikilink]] to an existing note in the user's Obsidian vault."""
+    if not _ext_ok():
+        return "(external Obsidian vault not configured)"
+    from core import obsidian as _ob
+    r = _ob.add_wikilink(
+        _ob.resolve_vault_path(CONFIG), rel_path, target,
+        label=label, config=CONFIG,
+    )
+    return r.get("preview") if r.get("ok") else f"error: {r.get('error')}"
+
+
+@mcp.tool()
+def obsidian_rename(old_rel: str, new_rel: str) -> str:
+    """Rename / move a note. Updates every incoming wikilink across the vault."""
+    if not _ext_ok():
+        return "(external Obsidian vault not configured)"
+    from core import obsidian as _ob
+    r = _ob.rename_note(
+        _ob.resolve_vault_path(CONFIG), old_rel, new_rel, config=CONFIG,
+    )
+    return r.get("preview") if r.get("ok") else f"error: {r.get('error')}"
+
+
+@mcp.tool()
+def obsidian_delete(rel_path: str) -> str:
+    """Soft-delete a note (moves to _trash/, reversible)."""
+    if not _ext_ok():
+        return "(external Obsidian vault not configured)"
+    from core import obsidian as _ob
+    r = _ob.delete_note(_ob.resolve_vault_path(CONFIG), rel_path, config=CONFIG)
+    return r.get("preview") if r.get("ok") else f"error: {r.get('error')}"
+
+
+# ── Utility (free web search, persistent reminders, clock) ───────────────
+
+@mcp.tool()
+def web_search(query: str, max_results: int = 5) -> str:
+    """Free DuckDuckGo search. For current info beyond the model's cutoff —
+    news, prices, live facts. Returns up to `max_results` title/URL/snippet."""
+    from core.reflection import _model1_tool_dispatch
+    return _model1_tool_dispatch(
+        VAULT, "web_search",
+        {"query": query, "max_results": max_results}, CONFIG,
+    )
+
+
+@mcp.tool()
+def current_time() -> str:
+    """Current wall-clock time + date in the user's local timezone."""
+    from core.reflection import _model1_tool_dispatch
+    return _model1_tool_dispatch(VAULT, "current_time", {}, CONFIG)
+
+
+@mcp.tool()
+def schedule_reminder(message: str, cron: str | None = None, once_at: str | None = None) -> str:
+    """Schedule a persistent reminder. Provide either `cron` (5-field
+    recurring) or `once_at` (ISO datetime, one-shot). Persisted in
+    vault/_meta/schedule.json — survives restarts."""
+    from core.reflection import _model1_tool_dispatch
+    args = {"message": message}
+    if cron: args["cron"] = cron
+    if once_at: args["once_at"] = once_at
+    return _model1_tool_dispatch(VAULT, "schedule_reminder", args, CONFIG)
+
+
+@mcp.tool()
+def list_reminders() -> str:
+    """Every active scheduled reminder (id, next_fire, message)."""
+    from core.reflection import _model1_tool_dispatch
+    return _model1_tool_dispatch(VAULT, "list_reminders", {}, CONFIG)
+
+
+@mcp.tool()
+def cancel_reminder(id: str) -> str:
+    """Remove a scheduled reminder by id."""
+    from core.reflection import _model1_tool_dispatch
+    return _model1_tool_dispatch(VAULT, "cancel_reminder", {"id": id}, CONFIG)
+
+
 if __name__ == "__main__":
     mcp.run()

@@ -65,19 +65,31 @@ def test_mute_auto_unmute_schedules(tmp_path):
 
 def test_set_timer_rejects_zero(tmp_path):
     runtime.clear()
+    # Ensure vault dir exists for cron store
+    (Path(tmp_path) / "vault" / "_meta").mkdir(parents=True, exist_ok=True)
     out = _dispatch("set_timer", {"seconds": 0, "message": "noop"}, _cfg(tmp_path))
     assert "positive" in out.lower() or "bad" in out.lower()
 
 
-def test_set_timer_schedules_and_reports(tmp_path):
+def test_set_timer_persists_and_returns_id(tmp_path):
+    """set_timer routes through the cron store so the timer is cancellable."""
+    from core import cron as _cron
     runtime.clear()
-    with patch("threading.Timer") as timer_cls:
-        out = _dispatch(
-            "set_timer", {"seconds": 90, "message": "tea"}, _cfg(tmp_path),
-        )
-    timer_cls.assert_called_once()
+    vault = Path(tmp_path) / "vault"
+    (vault / "_meta").mkdir(parents=True, exist_ok=True)
+    out = _dispatch(
+        "set_timer", {"seconds": 90, "message": "tea"}, _cfg(tmp_path),
+    )
     assert "tea" in out
     assert "1m 30s" in out
+    # Persistent entry exists and is cancellable by the returned id.
+    entries = _cron.load(vault)
+    assert len(entries) == 1
+    rid = entries[0]["id"]
+    assert rid in out
+    cancel = _dispatch("cancel_reminder", {"id": rid}, _cfg(tmp_path))
+    assert "removed" in cancel.lower()
+    assert _cron.load(vault) == []
 
 
 def test_capture_camera_no_backend(tmp_path):

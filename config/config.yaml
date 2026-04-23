@@ -35,13 +35,13 @@ providers:
 models:
   model1:
     provider: mistral
-    model: magistral-medium-latest
+    model: mistral-large-latest
   routine:
     provider: mistral
-    model: magistral-medium-latest
+    model: mistral-large-latest
   deep:
     provider: mistral
-    model: magistral-medium-latest
+    model: mistral-large-latest
 
 retrieval:
   entry_points: 8
@@ -84,6 +84,18 @@ monitor:
   min_body_chars: 20
 
 reflection:
+  # Background checkpoint-reflector — for always-on agents the session
+  # never ends, so reflection has to happen in the middle. Every
+  # `check_interval_sec` the worker inspects state; if the transcript
+  # has grown past `min_transcript_chars` AND you've been idle for
+  # `min_idle_sec` AND it's been at least `min_gap_sec` since the last
+  # reflection, a full session_mgr.end() runs on the accumulated
+  # turns and the processed turns are trimmed from memory.
+  background:
+    check_interval_sec: 120      # poll rate
+    min_transcript_chars: 500    # won't reflect on trivial chatter
+    min_idle_sec: 120            # wait for a natural lull
+    min_gap_sec: 600             # 10 min minimum between reflections
   min_flags_for_reflection: 1
   # Recovery thresholds — when Model 1 emits 0 flags but the transcript is
   # substantive, trigger reflection anyway. Without recovery, rich technical
@@ -99,17 +111,41 @@ reflection:
   # Retry with exponential backoff on rate-limit errors from the provider.
   retry:
     max_retries: 3
+
+# Background vault-wide audit — analog of `/meta` but scheduled. This
+# is NOT per-session reflection; it's the janitor: cleans stubs,
+# reconciles tension nodes, finds orphans, synthesises tool-use
+# patterns. Runs every `interval_sec` when chat has been idle. Last
+# run is persisted to `vault/_meta/meta_last_run.txt` so restarts
+# don't trigger an extra audit.
+meta:
+  background:
+    interval_sec: 21600          # 6h between audits (4/day max)
+    min_idle_sec: 180            # 3m idle before it fires
     backoff_base_sec: 2.0
 
 session:
   max_context_files: 20
-  history_window: 12
-  # Agentic Model 1: let the chat model iteratively call memory tools during a
-  # turn. Enables multi-hop answers ("citizenship of spouse of author of X")
-  # that a single retrieval can't produce. Costs a few extra API calls per
-  # complex question; disable for fast/cheap mode.
+  # 8 is enough turns of back-and-forth for coherence — she has retrieved
+  # context + self.md + mood + recent tool log filling in long-term state.
+  # Lower window = fewer input tokens = faster time-to-first-token.
+  history_window: 8
+  # Agentic Model 1: let the chat model iteratively call memory / obsidian
+  # / web tools during a turn. Enables multi-hop answers ("what did I write
+  # about X that relates to Y") that a single retrieval can't produce.
+  #
+  # Latency trade-off (important for voice):
+  #   true  → ~1-3s per extra tool round. On Mistral Large with 1-2 rounds,
+  #           total time-to-first-word is ~3-6s. Slower, but she can search
+  #           your vault and the web mid-reply.
+  #   false → single streaming call. Time-to-first-word ~0.5-1.5s — much
+  #           snappier. Model only has the context retrieval did up front.
+  #
+  # Flip to false if voice latency matters more than tool-use.
   agentic_model1: true
-  max_tool_rounds: 5
+  # Max tool rounds per turn. Each round = full API roundtrip. 3 is the
+  # sweet spot — lets her chain up to 2 tool calls + final answer.
+  max_tool_rounds: 3
 
 mcp:
   server_name: memory-system

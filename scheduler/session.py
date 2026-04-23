@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from core import flagging, reflection, retrieval
+from core import decay, flagging, reflection, retrieval
 from utils import frontmatter
 
 SESSIONS_DIR_NAME = "_meta"
@@ -175,6 +175,33 @@ def start(task: str, tags: list[str], config: dict[str, Any], project_root: Path
             "can tell sourced-from-their-notes apart from my own guesses.\n"
         )
 
+    # Inject recent tool-use history so the model learns across turns.
+    try:
+        from core import tool_memory as _tm
+        summary = _tm.prompt_summary(vault)
+    except Exception:
+        summary = ""
+    if summary:
+        composed_system += (
+            "\n\n## Recent tool use (learn from this)\n\n"
+            "My last dozen tool calls and how they went. Use the pattern: "
+            "repeat what worked (`✓`), avoid what returned nothing (`∅`), "
+            "don't repeat errors (`✗`). If a query shape reliably returned "
+            "empty results, try a shorter keyword or a different tool.\n\n"
+            f"{summary}\n"
+        )
+
+    # Affective state — rolling mood from recent labeled episodes. Tells
+    # the model what register to hold today: if recent sessions have
+    # trended heavy, she shouldn't open with `[laugh]`.
+    try:
+        from core import mood as _mood
+        mood_block = _mood.mood_snippet(vault)
+    except Exception:
+        mood_block = ""
+    if mood_block:
+        composed_system += f"\n\n{mood_block}\n"
+
     return {
         "task": task,
         "tags": tags,
@@ -289,6 +316,21 @@ def end(
         result["recovery_mode"] = recovery
         result["reflection_output"] = output
         result["writes"] = writes
+
+    # Run decay after reflection so new/updated nodes keep their
+    # freshness, while un-referenced nodes drift toward archive. Without
+    # this call the archive stays empty and memory rot accumulates — the
+    # vault grows forever, every node equally important.
+    d_cfg = config.get("decay") or {}
+    try:
+        decayed = decay.run(
+            vault_path=vault,
+            lambda_=float(d_cfg.get("lambda", 0.02)),
+            archive_threshold=float(d_cfg.get("archive_threshold", 0.10)),
+        )
+        result["decayed"] = decayed
+    except Exception as exc:
+        result["decay_error"] = f"{type(exc).__name__}: {exc}"
 
     _log_session(vault, session_meta, flags, result)
     return result

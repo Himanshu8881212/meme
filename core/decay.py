@@ -34,6 +34,23 @@ def _to_date(value: Any, default: date) -> date:
         return default
 
 
+def _safe_int(value: Any, default: int) -> int:
+    """Tolerant int coercion. The LLM occasionally leaves literal
+    placeholder strings like '<incremented>' in frontmatter; without
+    this guard the whole decay pass crashes on one bad file."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def run(vault_path: str | Path, lambda_: float, archive_threshold: float) -> dict[str, Any]:
     vault = Path(vault_path)
     today = date.today()
@@ -61,22 +78,22 @@ def run(vault_path: str | Path, lambda_: float, archive_threshold: float) -> dic
         # archived by a 35-day half-life if not re-accessed. Their retrieval
         # weight stays at their importance (no recency penalty).
         if fm.get("pin"):
-            fm["decay_weight"] = float(fm.get("importance", 1.0))
+            fm["decay_weight"] = _safe_float(fm.get("importance", 1.0), 1.0)
             fm["archived"] = False
             frontmatter.write(path, fm, body)
             processed += 1
             continue
 
         name = path.stem
-        connections = backlinks.get(name, int(fm.get("connection_count", 0)))
+        connections = backlinks.get(name, _safe_int(fm.get("connection_count", 0), 0))
         last = _to_date(fm.get("last_accessed") or fm.get("created"), today)
         days = max((today - last).days, 0)
 
         strength = compute_strength(
-            importance=float(fm.get("importance", 0.5)),
+            importance=_safe_float(fm.get("importance", 0.5), 0.5),
             connections=connections,
             days_since_access=days,
-            access_count=int(fm.get("access_count", 1)),
+            access_count=_safe_int(fm.get("access_count", 1), 1),
             lambda_=lambda_,
         )
 
